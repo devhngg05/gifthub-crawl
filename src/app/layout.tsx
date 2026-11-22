@@ -14,7 +14,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "GitHub Tool Radar",
-  description: "Kho công cụ mã nguồn mở tự động phân loại bằng AI",
+  description:
+    "Kho công cụ mã nguồn mở nổi bật trên GitHub, tự động kiểm duyệt và phân loại bằng AI.",
 };
 
 export default function RootLayout({
@@ -25,9 +26,11 @@ export default function RootLayout({
   return (
     <html
       lang="vi"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className={`${geistSans.variable} ${geistMono.variable} dark h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="min-h-full bg-zinc-950 text-zinc-100 font-sans selection:bg-emerald-500/30 selection:text-emerald-200 flex flex-col">
+        {children}
+      </body>
     </html>
   );
 }

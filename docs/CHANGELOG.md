@@ -2,6 +2,22 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.8] - 2026-11-22 (Module 6 theo kế hoạch — Giao diện Web Dark Mode & Nhật ký đồng bộ)
+### Đã thiết lập
+- Cập nhật cấu hình Next.js & Theme Dark Mode:
+  - Gỡ `cacheComponents` và `partialPrefetching` trong `next.config.ts` (giữ nguyên `@tailwindcss/turbopack` cho Tailwind CSS v4) để tương thích `export const dynamic = "force-dynamic"`.
+  - Hoàn thiện `src/app/globals.css` và `src/app/layout.tsx` với theme Dark Mode developer-first (`bg-zinc-950`, chữ `zinc-100`, điểm nhấn `emerald-400/500`, font `Geist Sans` & `Geist Mono`, `lang="vi"`).
+- Tách module helper thuần `src/lib/ui-helpers.ts` kèm bộ unit test `src/lib/__tests__/ui-helpers.test.ts`:
+  - `parseToolSearchParams()` (hỗ trợ cả tên chuẩn `category`, `subCategory`, `usability`, `pinned`, `q`, `sort` lẫn alias `sub`, `level`), `buildFilterUrl()`, `hasActiveFilters()`, `computeToolCounts()` (đếm cả nhãn chính và `secondarySubCategories` không trùng lặp), `formatStars()`, `formatIsoDate()`, `formatRelativeTimeVi()`, `escapeLikePattern()`.
+- Hoàn thiện 4 Component tương tác (`src/components/`):
+  - `RelativeTime.tsx`: dùng `useSyncExternalStore` render `YYYY-MM-DD` khi SSR/hydrate và chuyển sang thời gian tương đối tiếng Việt trên client (chống Hydration Mismatch).
+  - `Sidebar.tsx`: cây danh mục 2 tầng đọc trực tiếp từ `TAXONOMY` (7 nhóm / 25 ngách), badge đếm thật từ DB, lọc nhanh `Tất cả`, `Đã ghim`, `Chưa phân loại`, link `/logs` và Drawer responsive trên mobile.
+  - `SearchToolbar.tsx`: tìm kiếm debounce 300ms đồng bộ URL, phím tắt `Ctrl + K` / `/`, bộ lọc 3 mức `usability` (`app-ready`, `cli-tool`, `dev-required`), đổi `sort` (`stars` / `recent`) và nút xóa bộ lọc.
+  - `ToolCard.tsx`: hiển thị đầy đủ metadata công cụ, thao tác `PATCH /api/tools/[id]` cho 3 trường chuẩn (`isPinned`, `userNotes`, `subCategory`), kèm Modal nhập `Admin Secret` lưu vào `sessionStorage` (`x-admin-secret`) khi server trả `401`.
+- Hoàn thiện 2 trang Server Component (`export const dynamic = "force-dynamic"`):
+  - `src/app/page.tsx`: đọc `await searchParams`, truy vấn Neon PostgreSQL qua Drizzle ORM, tối ưu lọc `secondarySubCategories` bằng toán tử containment `@>` (`arrayContains`) tận dụng GIN Index, ưu tiên nhãn chính + `isPinned` + `stars`/`lastPushedAt`, kèm Empty State rõ ràng.
+  - `src/app/logs/page.tsx`: hiển thị 4 thẻ tổng quan thật từ DB và bảng 30 bản ghi `sync_logs` gần nhất (`ranAt DESC`) highlight `failedCount > 0` và `errorSummary`.
+
 ## [0.1.7] - 2026-11-22 (Module 5 theo kế hoạch — Lớp xác thực Admin & API cá nhân hóa PATCH /api/tools/[id])
 ### Đã thiết lập
 - Hoàn thiện `src/lib/auth.ts`:
@@ -79,5 +95,5 @@ Tài liệu theo dõi phiên bản và tiến độ triển khai từng module c
 - [x] **Module 2 — Tầng Database (Neon + Drizzle):** `drizzle.config.ts`, `src/db/index.ts` (`sanitizeDatabaseUrl`), `src/db/schema.ts` (`tools`, `syncLogs`, B-Tree & 3 GIN indexes) + push schema lên Neon + unit tests
 - [ ] **Module 3 — Worker AI & GitHub Sync:** `scripts/load-env.ts` (xong), `scripts/lib/github.ts` (xong), `scripts/lib/classifier.ts` (xong), `scripts/sync-tools.ts` (xong code + unit tests offline), `scripts/__tests__/*.test.ts` (xong); còn chạy thử đồng bộ thật trên Neon
 - [x] **Module 4 — API Route:** `src/app/api/tools/[id]/route.ts` (`PATCH` + `ADMIN_SECRET` + `SUB_CATEGORY_MAP` đồng bộ `category` + `array_remove` trên `secondarySubCategories`) + unit tests (`route.test.ts`)
-- [ ] **Module 5 — Giao diện Radar & Nhật ký:** `src/app/layout.tsx`, `src/app/page.tsx`, `src/app/logs/page.tsx`, `src/components/Sidebar.tsx`, `src/components/SearchToolbar.tsx`, `src/components/ToolCard.tsx`, `src/components/RelativeTime.tsx` + kiểm chứng Dark Mode & Hydration
-- [ ] **Module 6 — Tự động hóa & Ship:** `.github/workflows/daily-sync.yml` (xong), rà soát lint/typecheck/test/build toàn diện (chờ hoàn tất UI/API để chạy `npm run build` cuối cùng)
+- [x] **Module 5 — Giao diện Radar & Nhật ký:** `src/app/layout.tsx`, `src/app/globals.css`, `src/app/page.tsx`, `src/app/logs/page.tsx`, `src/components/Sidebar.tsx`, `src/components/SearchToolbar.tsx`, `src/components/ToolCard.tsx`, `src/components/RelativeTime.tsx`, `src/lib/ui-helpers.ts` + unit tests (`ui-helpers.test.ts`) & build production Dark Mode
+- [ ] **Module 6 — Tự động hóa & Ship:** `.github/workflows/daily-sync.yml` (xong), rà soát lint/typecheck/test/build toàn diện (chờ kiểm thử trình duyệt thực tế & ship)
