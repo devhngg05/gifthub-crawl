@@ -2,6 +2,19 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.7] - 2026-11-22 (Module 5 theo kế hoạch — Lớp xác thực Admin & API cá nhân hóa PATCH /api/tools/[id])
+### Đã thiết lập
+- Hoàn thiện `src/lib/auth.ts`:
+  - Cài đặt `verifyAdminSecret(headerValue: string | null)` đọc `process.env.ADMIN_SECRET` và `process.env.NODE_ENV` tại runtime.
+  - Khi `ADMIN_SECRET` được cấu hình: băm SHA-256 cho cả secret cấu hình và header `x-admin-secret`, so sánh an toàn bằng `crypto.timingSafeEqual` (tránh rò rỉ timing/độ dài); thiếu hoặc sai trả `{ authorized: false, status: 401 }`.
+  - Khi `ADMIN_SECRET` trống: ở local dev (`NODE_ENV !== "production"`) cho phép bypass kèm `console.warn` 1 dòng (không lộ secret); ở `production` bắt buộc fail-closed trả `{ authorized: false, status: 503 }`.
+- Hoàn thiện `src/app/api/tools/[id]/route.ts`:
+  - Cài đặt `PATCH(request: NextRequest, context: { params: Promise<{ id: string }> })` gọi `verifyAdminSecret(request.headers.get("x-admin-secret"))` trước tiên (`401`/`503`).
+  - Validate `id` qua `ToolIdParamSchema`, parse JSON body an toàn (`400` khi hỏng) và kiểm tra chặt qua `ToolPatchSchema` (chỉ nhận 3 trường `isPinned`, `userNotes`, `subCategory`).
+  - Khi cập nhật `subCategory`: tự động đồng bộ `category` từ `SUB_CATEGORY_MAP[subCategory].category` trong `src/config/taxonomy.ts`, đồng thời lọc bỏ `subCategory` mới khỏi `secondarySubCategories` một cách nguyên tử bằng `array_remove(${tools.secondarySubCategories}, ${subCategory}::text)` và cập nhật `updatedAt`.
+  - Cập nhật qua `.returning()` trên Drizzle ORM, trả `404` nếu không tìm thấy bản ghi, `200` (`{ tool }`) khi thành công và `500` an toàn khi DB lỗi.
+- Tạo bộ unit test offline Vitest (`src/lib/__tests__/auth.test.ts` và `src/app/api/tools/[id]/__tests__/route.test.ts` mock `@/db`) kiểm chứng đầy đủ các kịch bản 200, 400, 401, 404, 500, 503 và biểu thức SQL `array_remove(..., ::text)`.
+
 ## [0.1.6] - 2026-11-22 (Module 4 theo kế hoạch — Worker đồng bộ dữ liệu & GitHub Actions Workflow)
 ### Đã thiết lập
 - Hoàn thiện `scripts/load-env.ts`: gọi `dotenv.config({ path: ".env.local", quiet: true })` ngay khi import và an toàn trên CI khi thiếu tệp `.env.local`.
@@ -62,9 +75,9 @@ Tài liệu theo dõi phiên bản và tiến độ triển khai từng module c
 ## Checklist tiến độ từng Module
 
 - [x] **Mốc 0:** Tài liệu nền tảng (`docs/`), `AGENTS.md`, `.agents/rules/`, `.agents/skills/` và `.gitignore` (`!.env.example`)
-- [ ] **Module 1 — Khung xương Next.js & Cấu hình:** `package.json`, `.env.example`, `vitest.config.ts`, `src/config/taxonomy.ts` (7 nhóm / 25 ngách — xong), `src/lib/validator.ts` (`AiClassificationSchema` & PATCH schema — xong), `src/lib/auth.ts` (chưa làm) + unit tests (`taxonomy.test.ts`, `validator.test.ts` — xong)
+- [x] **Module 1 — Khung xương Next.js & Cấu hình:** `package.json`, `.env.example`, `vitest.config.ts`, `src/config/taxonomy.ts` (7 nhóm / 25 ngách — xong), `src/lib/validator.ts` (`AiClassificationSchema` & PATCH schema — xong), `src/lib/auth.ts` (xong) + unit tests (`taxonomy.test.ts`, `validator.test.ts`, `auth.test.ts` — xong)
 - [x] **Module 2 — Tầng Database (Neon + Drizzle):** `drizzle.config.ts`, `src/db/index.ts` (`sanitizeDatabaseUrl`), `src/db/schema.ts` (`tools`, `syncLogs`, B-Tree & 3 GIN indexes) + push schema lên Neon + unit tests
 - [ ] **Module 3 — Worker AI & GitHub Sync:** `scripts/load-env.ts` (xong), `scripts/lib/github.ts` (xong), `scripts/lib/classifier.ts` (xong), `scripts/sync-tools.ts` (xong code + unit tests offline), `scripts/__tests__/*.test.ts` (xong); còn chạy thử đồng bộ thật trên Neon
-- [ ] **Module 4 — API Route:** `src/app/api/tools/[id]/route.ts` (`PATCH` + `ADMIN_SECRET` + `SUB_CATEGORY_MAP` đồng bộ `category`) + unit tests
+- [x] **Module 4 — API Route:** `src/app/api/tools/[id]/route.ts` (`PATCH` + `ADMIN_SECRET` + `SUB_CATEGORY_MAP` đồng bộ `category` + `array_remove` trên `secondarySubCategories`) + unit tests (`route.test.ts`)
 - [ ] **Module 5 — Giao diện Radar & Nhật ký:** `src/app/layout.tsx`, `src/app/page.tsx`, `src/app/logs/page.tsx`, `src/components/Sidebar.tsx`, `src/components/SearchToolbar.tsx`, `src/components/ToolCard.tsx`, `src/components/RelativeTime.tsx` + kiểm chứng Dark Mode & Hydration
 - [ ] **Module 6 — Tự động hóa & Ship:** `.github/workflows/daily-sync.yml` (xong), rà soát lint/typecheck/test/build toàn diện (chờ hoàn tất UI/API để chạy `npm run build` cuối cùng)
