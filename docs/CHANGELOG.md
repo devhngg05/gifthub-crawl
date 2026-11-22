@@ -2,6 +2,11 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.2] - 2026-11-22 (Mốc 2 — Kiểm chứng hạ tầng Vitest)
+### Đã thiết lập
+- Xác minh `vitest.config.ts` (alias `@` → `./src`) và script `"test": "vitest run"` trong `package.json` khớp với `tsconfig.json`.
+- Tạo smoke test `src/lib/__tests__/smoke.test.ts` import qua alias `@/config/taxonomy` và xác nhận `npm test` + `npx tsc --noEmit` pass 100%.
+
 ## [0.1.1] - 2026-11-22 (Mốc 1 — Dựng khung xương dự án)
 ### Đã thiết lập
 - Khởi tạo khung Next.js App Router (`--src-dir`, TypeScript, Tailwind CSS, alias `@/*`) bảo toàn toàn bộ tệp nền tảng (`AGENTS.md`, `.agents/`, `docs/`, `.gitignore`).
