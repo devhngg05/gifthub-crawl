@@ -36,10 +36,10 @@
 - **`fetchCleanReadme(fullName)`:** Tải `/repos/{fullName}/readme`, giải mã base64, dùng Regex xóa thẻ HTML, ảnh Markdown, badges, rút gọn khoảng trắng, cắt tối đa **2.500 ký tự đầu**, trả `{ sha, text }`.
 
 ## 4. AI Multi-Provider Fallback (`scripts/lib/classifier.ts`)
-- Lọc mảng `PROVIDERS` bỏ provider thiếu API key trong env; gọi `/chat/completions` với `response_format: { type: "json_object" }`, `temperature: 0.2`:
-  1. `Groq-70B`: `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | `GROQ_API_KEY`
-  2. `Groq-8B-Fallback`: `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | `GROQ_API_KEY`
-  3. `GitHub-Models-4o-mini`: `https://models.github.ai/inference` | `openai/gpt-4o-mini` | `GITHUB_TOKEN`
-  4. `OpenRouter-Free`: `https://openrouter.ai/api/v1` | `meta-llama/llama-3.3-70b-instruct:free` | `OPENROUTER_API_KEY`
-- Fallback sang provider kế tiếp khi gặp HTTP `429`, `>= 500`, lỗi mạng hoặc JSON lỗi; làm sạch markdown code fence trước `JSON.parse` + `AiClassificationSchema`.
+- Lọc mảng `PROVIDERS` bỏ provider thiếu API key trong env; gọi `${baseUrl}/chat/completions` với `temperature: 0.2`, `max_tokens: 4096` (>= 2048 cho model reasoning):
+  1. `Groq-120B`: `https://api.groq.com/openai/v1` | `openai/gpt-oss-120b` | `GROQ_API_KEY` (có `response_format: { type: "json_object" }`, tự retry bỏ tham số này nếu HTTP `400`)
+  2. `Groq-Qwen-27B`: `https://api.groq.com/openai/v1` | `qwen/qwen3.8-27b` | `GROQ_API_KEY` (có `response_format: { type: "json_object" }`, tự retry bỏ tham số này nếu HTTP `400`)
+  3. `Groq-20B-Fast`: `https://api.groq.com/openai/v1` | `openai/gpt-oss-20b` | `GROQ_API_KEY` (có `response_format: { type: "json_object" }`, tự retry bỏ tham số này nếu HTTP `400`)
+  4. `OpenRouter-Free`: `https://openrouter.ai/api/v1` | `google/gemma-4-31b-it:free` | `OPENROUTER_API_KEY` (không gửi `response_format` để tương thích free router)
+- Fallback sang provider kế tiếp khi gặp HTTP non-2xx (kèm log `endpointUrl` + body lỗi đã sanitize tối đa 200 ký tự), lỗi mạng hoặc JSON lỗi; lọc `<think>...</think>`, gỡ markdown code fence và bóc JSON object trước `JSON.parse` + `AiClassificationSchema`.
 - Luôn tóm tắt tiếng Việt tự nhiên (giữ nguyên tên công nghệ/thuật ngữ tiếng Anh). Nếu cả 4 provider lỗi → bỏ qua không upsert repo vào `tools`.

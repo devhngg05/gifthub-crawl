@@ -10,17 +10,21 @@ on:
         required: false
         default: "25"
 
+permissions:
+  contents: read
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - run: npm ci
-      - run: npm run sync
+      - run: npx tsx scripts/sync-tools.ts
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}

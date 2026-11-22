@@ -2,6 +2,25 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.6] - 2026-11-22 (Module 4 theo kế hoạch — Worker đồng bộ dữ liệu & GitHub Actions Workflow)
+### Đã thiết lập
+- Hoàn thiện `scripts/load-env.ts`: gọi `dotenv.config({ path: ".env.local", quiet: true })` ngay khi import và an toàn trên CI khi thiếu tệp `.env.local`.
+- Hoàn thiện `scripts/sync-tools.ts`:
+  - Giữ `import "./load-env";` ở dòng đầu tiên trước toàn bộ các import khác (`@/db`, `@/db/schema`, `./lib/github`, `./lib/classifier`).
+  - Đọc và validate `process.env.SYNC_LIMIT` qua `zod` (mặc định `20`), chỉ đếm giới hạn trên các repository thực sự cần gọi AI (không tính nhầm repo chỉ cập nhật stars).
+  - Triển khai Idempotency theo `readmeSha` (`stars`, `lastPushedAt`, `updatedAt` + `updatedStarsOnly`), đồng thời nếu đã chạm `SYNC_LIMIT` mà gặp repo cũ đổi `readmeSha` thì chỉ cập nhật stars/metadata và giữ nguyên `readmeSha` cũ để lượt sau tự động phân loại lại.
+  - Triển khai UPSERT `onConflictDoUpdate` theo `githubId` bảo toàn tuyệt đối `isPinned` và `userNotes` (không đưa vào payload insert/update), kèm `sleep(1500)` sau mỗi repo phân loại AI.
+  - Bọc `try/catch` từng repository (per-repo isolation), bỏ qua upsert khi cả 4 AI provider fail (`failedCount++`), làm sạch thông điệp lỗi qua `sanitizeErrorMessage()` để không lộ connection string/token, luôn ghi 1 dòng tổng kết vào `sync_logs` và in bảng tóm tắt `Tên repo | Provider đã dùng | subCategory | usability`.
+  - Chuẩn hóa CLI guard `isDirectExecution()` bằng `pathToFileURL(path.resolve(...)).href` (an toàn hoa/thường ổ đĩa trên Windows với `tsx`).
+- Cập nhật `.github/workflows/daily-sync.yml`: lịch `cron: "0 19 * * *"` + `workflow_dispatch` (input `limit` mặc định `"25"`), Node.js `24`, `permissions: contents: read`, chạy `npm ci` và `npx tsx scripts/sync-tools.ts` với đủ 5 biến môi trường (`DATABASE_URL`, `GITHUB_TOKEN`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `SYNC_LIMIT`).
+- Tạo bộ unit test offline Vitest (`scripts/__tests__/load-env.test.ts` và `scripts/__tests__/sync-tools.test.ts`) kiểm chứng idempotency, bảo toàn `isPinned`/`userNotes`, per-repo isolation khi AI fail, đếm đúng `SYNC_LIMIT`, CLI guard Windows và làm sạch secret trong log.
+
+## [0.1.5] - 2026-11-22 (Module 3 — Bộ thu thập GitHub & Bộ phân loại AI Multi-Provider Fallback)
+### Đã thiết lập
+- Hoàn thiện `scripts/lib/github.ts` với header chuẩn GitHub API (`Accept`, `X-GitHub-Api-Version: 2022-11-28`, tùy chọn `Authorization: Bearer`), hàm `buildSearchQueries()` & `fetchCandidateRepos()` chạy song song 2 luồng tìm kiếm (Trụ cột `stars:>1500 pushed:>[6 tháng trước]` + Mới nổi `stars:>500 created:>[30 ngày trước]`), khử trùng theo `repo.id`, Quality Gate chặn repo thiếu `description`, `archived === true` hoặc chứa 7 topics rác (`awesome`, `awesome-list`, `roadmap`, `books`, `interview-questions`, `tutorial`, `cheatsheet`), và `fetchCleanReadme()` giải mã base64, xóa HTML/badges/ảnh Markdown, rút gọn khoảng trắng, cắt tối đa 2.500 ký tự đầu và xử lý an toàn HTTP `404`.
+- Hoàn thiện `scripts/lib/classifier.ts` lọc động danh sách `PROVIDERS` tại runtime theo thứ tự `Groq-70B` → `Groq-8B-Fallback` → `GitHub-Models-4o-mini` → `OpenRouter-Free`, gọi chuẩn OpenAI-compatible (`/chat/completions`, `temperature: 0.2`, `response_format: { type: "json_object" }`), nhúng trực tiếp `TAXONOMY_PROMPT_GUIDE` từ `src/config/taxonomy.ts`, yêu cầu tóm tắt tiếng Việt tự nhiên (giữ nguyên thuật ngữ/tags tiếng Anh), làm sạch markdown code fence trước khi `JSON.parse`, validate qua `AiClassificationSchema`, trả về `{ classification, provider }` và tự động fallback qua các tầng khi gặp HTTP `429`, `>= 500`, lỗi mạng, JSON hỏng hoặc sai schema (ném Error không chứa secret khi cả 4 provider đều thất bại).
+- Tạo bộ unit test offline Vitest (`scripts/lib/__tests__/github.test.ts` và `scripts/lib/__tests__/classifier.test.ts`, mock `fetch`) kiểm chứng toàn bộ cơ chế tìm kiếm song song, khử trùng, Quality Gate, làm sạch README/404 và chuỗi fallback 4 AI provider.
+
 ## [0.1.4] - 2026-11-22 (Module 2 — Tầng Database Neon & Drizzle)
 ### Đã thiết lập
 - Hoàn thiện `src/db/schema.ts` với bảng `tools` (đúng 20 cột chuẩn, `githubId` `bigint({ mode: "number" })` `NOT NULL UNIQUE`, mảng `text[]` mặc định `'{}'::text[]`), bảng `syncLogs` (`sync_logs`, đủ 7 cột chuẩn), 3 B-Tree indexes (`category`, `subCategory`, `stars`) và 3 GIN indexes (`secondarySubCategories`, `useCases`, `replaces`).
@@ -45,7 +64,7 @@ Tài liệu theo dõi phiên bản và tiến độ triển khai từng module c
 - [x] **Mốc 0:** Tài liệu nền tảng (`docs/`), `AGENTS.md`, `.agents/rules/`, `.agents/skills/` và `.gitignore` (`!.env.example`)
 - [ ] **Module 1 — Khung xương Next.js & Cấu hình:** `package.json`, `.env.example`, `vitest.config.ts`, `src/config/taxonomy.ts` (7 nhóm / 25 ngách — xong), `src/lib/validator.ts` (`AiClassificationSchema` & PATCH schema — xong), `src/lib/auth.ts` (chưa làm) + unit tests (`taxonomy.test.ts`, `validator.test.ts` — xong)
 - [x] **Module 2 — Tầng Database (Neon + Drizzle):** `drizzle.config.ts`, `src/db/index.ts` (`sanitizeDatabaseUrl`), `src/db/schema.ts` (`tools`, `syncLogs`, B-Tree & 3 GIN indexes) + push schema lên Neon + unit tests
-- [ ] **Module 3 — Worker AI & GitHub Sync:** `scripts/load-env.ts`, `scripts/lib/github.ts`, `scripts/lib/classifier.ts`, `scripts/sync-tools.ts` + unit tests + chạy thử đồng bộ thật
+- [ ] **Module 3 — Worker AI & GitHub Sync:** `scripts/load-env.ts` (xong), `scripts/lib/github.ts` (xong), `scripts/lib/classifier.ts` (xong), `scripts/sync-tools.ts` (xong code + unit tests offline), `scripts/__tests__/*.test.ts` (xong); còn chạy thử đồng bộ thật trên Neon
 - [ ] **Module 4 — API Route:** `src/app/api/tools/[id]/route.ts` (`PATCH` + `ADMIN_SECRET` + `SUB_CATEGORY_MAP` đồng bộ `category`) + unit tests
 - [ ] **Module 5 — Giao diện Radar & Nhật ký:** `src/app/layout.tsx`, `src/app/page.tsx`, `src/app/logs/page.tsx`, `src/components/Sidebar.tsx`, `src/components/SearchToolbar.tsx`, `src/components/ToolCard.tsx`, `src/components/RelativeTime.tsx` + kiểm chứng Dark Mode & Hydration
-- [ ] **Module 6 — Tự động hóa & Ship:** `.github/workflows/daily-sync.yml`, rà soát lint/typecheck/test/build toàn diện
+- [ ] **Module 6 — Tự động hóa & Ship:** `.github/workflows/daily-sync.yml` (xong), rà soát lint/typecheck/test/build toàn diện (chờ hoàn tất UI/API để chạy `npm run build` cuối cùng)
