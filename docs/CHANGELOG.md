@@ -2,6 +2,13 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.1] - 2026-11-22 (Mốc 1 — Dựng khung xương dự án)
+### Đã thiết lập
+- Khởi tạo khung Next.js App Router (`--src-dir`, TypeScript, Tailwind CSS, alias `@/*`) bảo toàn toàn bộ tệp nền tảng (`AGENTS.md`, `.agents/`, `docs/`, `.gitignore`).
+- Cài đặt dependencies (`lucide-react`, `@neondatabase/serverless`, `drizzle-orm`, `zod`) và devDependencies (`drizzle-kit`, `tsx`, `dotenv`, `vitest`, `@types/node`), cấu hình `vitest.config.ts` và scripts chuẩn trong `package.json`.
+- Tạo `.env.example` liệt kê đủ 7 biến môi trường không chứa secret thật.
+- Dựng toàn bộ cây thư mục và các file skeleton theo `docs/ARCHITECTURE.md` (chỉ gồm type/export signature tối giản, không `// TODO`, `npx tsc --noEmit` đạt 0 lỗi).
+
 ## [0.1.0] - 2026-11-22 (Mốc 0 — Kiến trúc & Hệ thống điều khiển)
 ### Đã thiết lập
 - Khởi tạo `.gitignore` chặn `.agents/mcp_config.json`, `node_modules/`, `.env*` và mở ngoại lệ `!.env.example`; thiết lập cấu hình MCP Servers (`neon`, `chrome-devtools`).
