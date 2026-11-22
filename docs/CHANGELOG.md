@@ -2,6 +2,13 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.4] - 2026-11-22 (Module 2 — Tầng Database Neon & Drizzle)
+### Đã thiết lập
+- Hoàn thiện `src/db/schema.ts` với bảng `tools` (đúng 20 cột chuẩn, `githubId` `bigint({ mode: "number" })` `NOT NULL UNIQUE`, mảng `text[]` mặc định `'{}'::text[]`), bảng `syncLogs` (`sync_logs`, đủ 7 cột chuẩn), 3 B-Tree indexes (`category`, `subCategory`, `stars`) và 3 GIN indexes (`secondarySubCategories`, `useCases`, `replaces`).
+- Hoàn thiện `src/db/index.ts` với `sanitizeDatabaseUrl()` (validate PostgreSQL URL bằng Zod, xóa `channel_binding` không phân biệt hoa/thường và giữ `sslmode=require`, không lộ credential trong thông điệp lỗi), `resolveAppDatabaseUrl()`, `resolveMigrationDatabaseUrl()`, `createDb()`, `getDb()`, và lazy proxy `db` dùng HTTP driver `neon()` + `drizzle-orm/neon-http`.
+- Hoàn thiện `drizzle.config.ts` nạp `.env.local` (fallback `.env`, chế độ `quiet`), ưu tiên `DATABASE_URL_UNPOOLED` (fallback `DATABASE_URL`) và chuẩn hóa qua `sanitizeDatabaseUrl()`.
+- Tạo unit test `src/db/__tests__/db.test.ts` (15 tests kiểm chứng `sanitizeDatabaseUrl()`, URL resolvers, khởi tạo client `neon()` với mock, và metadata schema/indexes); xác nhận `npm test` (43/43 tests), `npx tsc --noEmit`, `npm run lint` pass 100%, và chạy `npx drizzle-kit push --force` đẩy schema lên Neon thành công (`Changes applied`).
+
 ## [0.1.3] - 2026-11-22 (Module 1 — Bộ Taxonomy gốc & Bộ kiểm duyệt AI)
 ### Đã thiết lập
 - Hoàn thiện `src/config/taxonomy.ts` với đủ 7 nhóm lớn (`category`) và 25 ngách chuyên sâu (`sub_category`) kèm nhãn tiếng Việt và `hint` chi tiết đúng chuẩn `docs/PRD.md`; export đầy đủ `TAXONOMY`, `VALID_CATEGORIES`, `VALID_SUB_CATEGORIES`, `CATEGORY_MAP`, `SUB_CATEGORY_MAP`, `SUB_CATEGORY_TO_CATEGORY`, `isValidCategory`, `isValidSubCategory`, và `TAXONOMY_PROMPT_GUIDE`.
@@ -37,7 +44,7 @@ Tài liệu theo dõi phiên bản và tiến độ triển khai từng module c
 
 - [x] **Mốc 0:** Tài liệu nền tảng (`docs/`), `AGENTS.md`, `.agents/rules/`, `.agents/skills/` và `.gitignore` (`!.env.example`)
 - [ ] **Module 1 — Khung xương Next.js & Cấu hình:** `package.json`, `.env.example`, `vitest.config.ts`, `src/config/taxonomy.ts` (7 nhóm / 25 ngách — xong), `src/lib/validator.ts` (`AiClassificationSchema` & PATCH schema — xong), `src/lib/auth.ts` (chưa làm) + unit tests (`taxonomy.test.ts`, `validator.test.ts` — xong)
-- [ ] **Module 2 — Tầng Database (Neon + Drizzle):** `drizzle.config.ts`, `src/db/index.ts` (`sanitizeDatabaseUrl`), `src/db/schema.ts` (`tools`, `syncLogs`, B-Tree & 3 GIN indexes) + push schema lên Neon + unit tests
+- [x] **Module 2 — Tầng Database (Neon + Drizzle):** `drizzle.config.ts`, `src/db/index.ts` (`sanitizeDatabaseUrl`), `src/db/schema.ts` (`tools`, `syncLogs`, B-Tree & 3 GIN indexes) + push schema lên Neon + unit tests
 - [ ] **Module 3 — Worker AI & GitHub Sync:** `scripts/load-env.ts`, `scripts/lib/github.ts`, `scripts/lib/classifier.ts`, `scripts/sync-tools.ts` + unit tests + chạy thử đồng bộ thật
 - [ ] **Module 4 — API Route:** `src/app/api/tools/[id]/route.ts` (`PATCH` + `ADMIN_SECRET` + `SUB_CATEGORY_MAP` đồng bộ `category`) + unit tests
 - [ ] **Module 5 — Giao diện Radar & Nhật ký:** `src/app/layout.tsx`, `src/app/page.tsx`, `src/app/logs/page.tsx`, `src/components/Sidebar.tsx`, `src/components/SearchToolbar.tsx`, `src/components/ToolCard.tsx`, `src/components/RelativeTime.tsx` + kiểm chứng Dark Mode & Hydration
