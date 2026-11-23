@@ -6,6 +6,7 @@ import { db } from "@/db";
 import { tools } from "@/db/schema";
 import { sanitizeErrorMessage } from "@/lib/sanitize-error";
 import { parseSearchQuery, type ParsedSearchQuery } from "@/lib/search-engine";
+import { consumeSuggestRateLimit } from "@/lib/suggest-rate-limit";
 import {
   buildSearchRelevanceScore,
   buildSuggestRelaxedSearchCondition,
@@ -13,9 +14,25 @@ import {
   isMissingPgTrgmError,
 } from "@/lib/tool-query";
 
+const SUGGEST_CACHE_HEADERS = {
+  "Cache-Control": "public, s-maxage=300, stale-while-revalidate=600",
+} as const;
+
+const NO_STORE_HEADERS = {
+  "Cache-Control": "no-store",
+} as const;
+
 const SuggestQuerySchema = z.object({
   q: z.string().trim().max(120),
 });
+
+function getClientIp(request: NextRequest): string {
+  return (
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+    request.headers.get("x-real-ip")?.trim() ||
+    "unknown"
+  );
+}
 
 export interface SuggestedToolItem {
   id: number;
@@ -96,6 +113,20 @@ async function fetchSuggestedTools(
  * Trả tối đa 6 công cụ khớp nhất (Tầng 1 hoặc Tầng 2) và tối đa 3 ngách gợi ý từ từ điển song ngữ.
  */
 export async function GET(request: NextRequest): Promise<NextResponse> {
+  const rateLimit = consumeSuggestRateLimit(getClientIp(request));
+  if (rateLimit.blocked) {
+    return NextResponse.json(
+      { error: "Too many requests" },
+      {
+        status: 429,
+        headers: {
+          ...NO_STORE_HEADERS,
+          "Retry-After": String(rateLimit.retryAfterSeconds),
+        },
+      },
+    );
+  }
+
   const rawQ = request.nextUrl.searchParams.get("q") ?? "";
   const parsedParam = SuggestQuerySchema.safeParse({ q: rawQ });
 
@@ -108,12 +139,18 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
   const q = parsedParam.data.q;
   if (q.length < 2) {
-    return NextResponse.json({ tools: [], categories: [] }, { status: 200 });
+    return NextResponse.json(
+      { tools: [], categories: [] },
+      { status: 200, headers: SUGGEST_CACHE_HEADERS },
+    );
   }
 
   const parsedQuery = parseSearchQuery(q);
   if (!parsedQuery.normalizedQuery) {
-    return NextResponse.json({ tools: [], categories: [] }, { status: 200 });
+    return NextResponse.json(
+      { tools: [], categories: [] },
+      { status: 200, headers: SUGGEST_CACHE_HEADERS },
+    );
   }
 
   const categories: SuggestedCategoryItem[] = parsedQuery.matchedSubCategories
@@ -139,7 +176,7 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
 
     return NextResponse.json(
       { tools: suggestedTools, categories },
-      { status: 200 },
+      { status: 200, headers: SUGGEST_CACHE_HEADERS },
     );
   } catch (error) {
     const safeMessage = sanitizeErrorMessage(error);

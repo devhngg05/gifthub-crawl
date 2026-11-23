@@ -1,4 +1,5 @@
 import { eq, sql, type SQL } from "drizzle-orm";
+import { revalidateTag } from "next/cache";
 import { NextRequest, NextResponse } from "next/server";
 import {
   SUB_CATEGORY_MAP,
@@ -135,6 +136,8 @@ export async function PATCH(
     if (!updatedTool) {
       return NextResponse.json({ error: "Tool not found" }, { status: 404 });
     }
+
+    revalidateTag("tools", { expire: 0 });
 
     return NextResponse.json({ tool: updatedTool }, { status: 200 });
   } catch (error) {

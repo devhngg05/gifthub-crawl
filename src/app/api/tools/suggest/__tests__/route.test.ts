@@ -22,14 +22,23 @@ vi.mock("@/db", () => ({
 }));
 
 import { GET } from "@/app/api/tools/suggest/route";
+import {
+  SUGGEST_MAX_REQUESTS,
+  resetSuggestRateLimitForTests,
+} from "@/lib/suggest-rate-limit";
+
+const EXPECTED_CACHE_CONTROL =
+  "public, s-maxage=300, stale-while-revalidate=600";
 
 describe("GET /api/tools/suggest", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetSuggestRateLimitForTests();
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    resetSuggestRateLimitForTests();
   });
 
   it("returns empty suggestions immediately for queries shorter than 2 chars without querying DB", async () => {
@@ -37,22 +46,35 @@ describe("GET /api/tools/suggest", () => {
     const res = await GET(req);
 
     expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe(EXPECTED_CACHE_CONTROL);
     expect(await res.json()).toEqual({ tools: [], categories: [] });
+    expect(mockSelect).not.toHaveBeenCalled();
+
+    const emptyNormReq = new NextRequest(
+      `http://localhost/api/tools/suggest?q=${encodeURIComponent("??")}`,
+    );
+    const emptyNormRes = await GET(emptyNormReq);
+    expect(emptyNormRes.status).toBe(200);
+    expect(emptyNormRes.headers.get("cache-control")).toBe(
+      EXPECTED_CACHE_CONTROL,
+    );
+    expect(await emptyNormRes.json()).toEqual({ tools: [], categories: [] });
     expect(mockSelect).not.toHaveBeenCalled();
   });
 
-  it("returns 400 when q exceeds 120 characters", async () => {
+  it("returns 400 when q exceeds 120 characters without public Cache-Control", async () => {
     const longQ = "a".repeat(121);
     const req = new NextRequest(`http://localhost/api/tools/suggest?q=${longQ}`);
     const res = await GET(req);
 
     expect(res.status).toBe(400);
+    expect(res.headers.get("cache-control")).toBeNull();
     const json = await res.json();
     expect(json.error).toBe("Invalid query parameter");
     expect(mockSelect).not.toHaveBeenCalled();
   });
 
-  it("returns up to 6 matching tools and up to 3 suggested sub-categories from parseSearchQuery", async () => {
+  it("returns up to 6 matching tools and up to 3 suggested sub-categories with Cache-Control header", async () => {
     const fakeTools = [
       {
         id: 1,
@@ -72,6 +94,7 @@ describe("GET /api/tools/suggest", () => {
     const res = await GET(req);
 
     expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe(EXPECTED_CACHE_CONTROL);
     const json = (await res.json()) as {
       tools: typeof fakeTools;
       categories: Array<{ slug: string; label: string; categoryLabel: string }>;
@@ -168,7 +191,44 @@ describe("GET /api/tools/suggest", () => {
       new NextRequest("http://localhost/api/tools/suggest?q=ollama"),
     );
     expect(resErr.status).toBe(500);
+    expect(resErr.headers.get("cache-control")).toBeNull();
     expect(await resErr.json()).toEqual({ error: "Internal server error" });
     expect(String(errorSpy.mock.calls[0]?.[1])).not.toContain("supersecret");
+  });
+
+  it("returns 429 with Retry-After and no-store when an IP exceeds SUGGEST_MAX_REQUESTS within 60s", async () => {
+    const floodedIp = "203.0.113.50";
+    for (let i = 0; i < SUGGEST_MAX_REQUESTS; i += 1) {
+      const okRes = await GET(
+        new NextRequest("http://localhost/api/tools/suggest?q=a", {
+          headers: { "x-forwarded-for": `${floodedIp}, 10.0.0.1` },
+        }),
+      );
+      expect(okRes.status).toBe(200);
+      expect(okRes.headers.get("cache-control")).toBe(EXPECTED_CACHE_CONTROL);
+    }
+
+    const blockedRes = await GET(
+      new NextRequest("http://localhost/api/tools/suggest?q=ollama", {
+        headers: { "x-forwarded-for": floodedIp },
+      }),
+    );
+
+    expect(blockedRes.status).toBe(429);
+    expect(blockedRes.headers.get("cache-control")).toBe("no-store");
+    const retryAfter = Number(blockedRes.headers.get("retry-after"));
+    expect(Number.isInteger(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+    expect(await blockedRes.json()).toEqual({ error: "Too many requests" });
+    expect(mockSelect).not.toHaveBeenCalled();
+
+    const otherIpRes = await GET(
+      new NextRequest("http://localhost/api/tools/suggest?q=a", {
+        headers: { "x-real-ip": "198.51.100.20" },
+      }),
+    );
+    expect(otherIpRes.status).toBe(200);
+    expect(otherIpRes.headers.get("cache-control")).toBe(EXPECTED_CACHE_CONTROL);
   });
 });

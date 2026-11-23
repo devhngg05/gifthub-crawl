@@ -1,13 +1,14 @@
 import type { SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { tools, type ToolRow } from "@/db/schema";
+import { syncLogs, tools, type ToolRow } from "@/db/schema";
+import type { NewsfeedToolRow } from "@/lib/newsfeed";
 import { parseSearchQuery } from "@/lib/search-engine";
 import type { ToolCountBucket, ToolFilters } from "@/lib/ui-helpers";
 
 interface RecordedSelectCall {
   fields: Record<string, unknown> | undefined;
-  type: "groupBy" | "count" | "items";
+  type: "groupBy" | "count" | "items" | "newsfeedTools" | "latestSyncLog";
   fromTable: unknown;
   groupByCols?: unknown[];
   whereClause: SQL | undefined;
@@ -16,13 +17,32 @@ interface RecordedSelectCall {
   offset?: number;
 }
 
+interface RecordedCacheCall {
+  keyParts: string[] | undefined;
+  options: { revalidate?: number | false; tags?: string[] } | undefined;
+}
+
 const {
   recordedCalls,
+  recordedCacheCalls,
+  mockUnstableCache,
   setDbMockHandlers,
   resetDbMockHandlers,
   mockSelect,
 } = vi.hoisted(() => {
   const recordedCalls: RecordedSelectCall[] = [];
+  const recordedCacheCalls: RecordedCacheCall[] = [];
+
+  const mockUnstableCache = vi.fn(
+    <T extends (...args: never[]) => Promise<unknown>>(
+      cb: T,
+      keyParts?: string[],
+      options?: { revalidate?: number | false; tags?: string[] },
+    ): T => {
+      recordedCacheCalls.push({ keyParts, options });
+      return cb;
+    },
+  );
 
   type GroupByHandler = () => Promise<ToolCountBucket[]>;
   type CountHandler = (ctx: {
@@ -36,10 +56,14 @@ const {
     offset: number;
     callIndex: number;
   }) => Promise<ToolRow[]>;
+  type NewsfeedToolsHandler = () => Promise<NewsfeedToolRow[]>;
+  type LatestSyncLogHandler = () => Promise<Array<{ ranAt: Date | string }>>;
 
   let groupByHandler: GroupByHandler = async () => [];
   let countHandler: CountHandler = async () => [{ count: 0 }];
   let itemsHandler: ItemsHandler = async () => [];
+  let newsfeedToolsHandler: NewsfeedToolsHandler = async () => [];
+  let latestSyncLogHandler: LatestSyncLogHandler = async () => [];
   let countCallIndex = 0;
   let itemsCallIndex = 0;
 
@@ -47,6 +71,8 @@ const {
     onGroupBy?: GroupByHandler;
     onCount?: CountHandler;
     onItems?: ItemsHandler;
+    onNewsfeedTools?: NewsfeedToolsHandler;
+    onLatestSyncLog?: LatestSyncLogHandler;
   }) {
     if (handlers.onGroupBy) {
       groupByHandler = handlers.onGroupBy;
@@ -57,6 +83,12 @@ const {
     if (handlers.onItems) {
       itemsHandler = handlers.onItems;
     }
+    if (handlers.onNewsfeedTools) {
+      newsfeedToolsHandler = handlers.onNewsfeedTools;
+    }
+    if (handlers.onLatestSyncLog) {
+      latestSyncLogHandler = handlers.onLatestSyncLog;
+    }
   }
 
   function resetDbMockHandlers() {
@@ -66,10 +98,28 @@ const {
     groupByHandler = async () => [];
     countHandler = async () => [{ count: 0 }];
     itemsHandler = async () => [];
+    newsfeedToolsHandler = async () => [];
+    latestSyncLogHandler = async () => [];
   }
 
   const mockSelect = vi.fn((fields?: Record<string, unknown>) => ({
     from: vi.fn((fromTable: unknown) => ({
+      then<TResult1 = NewsfeedToolRow[], TResult2 = never>(
+        onfulfilled?:
+          | ((value: NewsfeedToolRow[]) => TResult1 | PromiseLike<TResult1>)
+          | null,
+        onrejected?:
+          | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
+          | null,
+      ) {
+        recordedCalls.push({
+          fields,
+          type: "newsfeedTools",
+          fromTable,
+          whereClause: undefined,
+        });
+        return newsfeedToolsHandler().then(onfulfilled, onrejected);
+      },
       groupBy: vi.fn((...groupByCols: unknown[]) => {
         recordedCalls.push({
           fields,
@@ -103,6 +153,29 @@ const {
         },
         orderBy: vi.fn((...orderByClauses: unknown[]) => ({
           limit: vi.fn((limit: number) => ({
+            then<
+              TResult1 = Array<{ ranAt: Date | string }>,
+              TResult2 = never,
+            >(
+              onfulfilled?:
+                | ((
+                    value: Array<{ ranAt: Date | string }>,
+                  ) => TResult1 | PromiseLike<TResult1>)
+                | null,
+              onrejected?:
+                | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
+                | null,
+            ) {
+              recordedCalls.push({
+                fields,
+                type: "latestSyncLog",
+                fromTable,
+                whereClause,
+                orderByClauses,
+                limit,
+              });
+              return latestSyncLogHandler().then(onfulfilled, onrejected);
+            },
             offset: vi.fn((offset: number) => {
               const idx = itemsCallIndex++;
               recordedCalls.push({
@@ -130,11 +203,17 @@ const {
 
   return {
     recordedCalls,
+    recordedCacheCalls,
+    mockUnstableCache,
     setDbMockHandlers,
     resetDbMockHandlers,
     mockSelect,
   };
 });
+
+vi.mock("next/cache", () => ({
+  unstable_cache: mockUnstableCache,
+}));
 
 vi.mock("@/db", () => ({
   db: {
@@ -143,10 +222,16 @@ vi.mock("@/db", () => ({
 }));
 
 import {
+  TOOLS_CACHE_REVALIDATE_SECONDS,
+  TOOLS_CACHE_TAG,
+  buildFilteredToolsCacheKey,
+  fetchNewsfeedPageData,
   fetchSidebarCountBuckets,
   fetchSidebarCountRows,
   queryToolsPageData,
 } from "@/lib/queries/tools-page-query";
+
+const initialCacheCalls = recordedCacheCalls.slice();
 
 function compileSql(expr: SQL): { sql: string; params: unknown[] } {
   return new PgDialect().sqlToQuery(expr);
@@ -418,5 +503,100 @@ describe("fetchSidebarCountBuckets & queryToolsPageData", () => {
     await expect(
       queryToolsPageData(defaultFilters, parseSearchQuery("")),
     ).rejects.toBe(dbFailure);
+  });
+
+  it("bọc fetchSidebarCountBuckets, fetchNewsfeedPageData và queryToolsPageData bằng unstable_cache với revalidate 300s và tag tools", async () => {
+    expect(TOOLS_CACHE_REVALIDATE_SECONDS).toBe(300);
+    expect(TOOLS_CACHE_TAG).toBe("tools");
+
+    expect(initialCacheCalls).toEqual(
+      expect.arrayContaining([
+        {
+          keyParts: ["tools-sidebar-counts"],
+          options: { revalidate: 300, tags: ["tools"] },
+        },
+        {
+          keyParts: ["tools-newsfeed-data"],
+          options: { revalidate: 300, tags: ["tools"] },
+        },
+      ]),
+    );
+
+    const filters: ToolFilters = {
+      category: "ai-llm",
+      subCategory: "ai-coding-agent",
+      usability: "app-ready",
+      pinned: true,
+      q: "claude, code",
+      sort: "relevance",
+      page: 2,
+    };
+    const parsedQuery = parseSearchQuery(filters.q);
+
+    await queryToolsPageData(filters, parsedQuery);
+
+    expect(mockUnstableCache).toHaveBeenCalledTimes(1);
+    expect(mockUnstableCache).toHaveBeenCalledWith(
+      expect.any(Function),
+      buildFilteredToolsCacheKey(filters, parsedQuery),
+      { revalidate: 300, tags: ["tools"] },
+    );
+  });
+
+  it("buildFilteredToolsCacheKey tạo khóa cache khác nhau cho mọi tham số lọc, tìm kiếm, sắp xếp và trang", () => {
+    const baseFilters: ToolFilters = { ...defaultFilters };
+    const baseKey = buildFilteredToolsCacheKey(
+      baseFilters,
+      parseSearchQuery(baseFilters.q),
+    ).join(",");
+
+    const variants: ToolFilters[] = [
+      { ...baseFilters, category: "ai-llm" },
+      { ...baseFilters, subCategory: "database-orm" },
+      { ...baseFilters, usability: "cli-tool" },
+      { ...baseFilters, pinned: true },
+      { ...baseFilters, q: "drizzle" },
+      { ...baseFilters, q: "drizzle,orm" },
+      { ...baseFilters, sort: "recent" },
+      { ...baseFilters, page: 3 },
+    ];
+
+    const keys = new Set<string>([baseKey]);
+    for (const variant of variants) {
+      const key = buildFilteredToolsCacheKey(
+        variant,
+        parseSearchQuery(variant.q),
+      ).join(",");
+      expect(keys.has(key)).toBe(false);
+      keys.add(key);
+    }
+  });
+
+  it("fetchNewsfeedPageData trả về danh sách công cụ và thời điểm đồng bộ mới nhất dạng ISO", async () => {
+    const sampleTool = makeToolRow({ id: 99, name: "goose" });
+    const ranAt = new Date("2026-11-23T12:00:00.000Z");
+
+    setDbMockHandlers({
+      onNewsfeedTools: async () => [sampleTool],
+      onLatestSyncLog: async () => [{ ranAt }],
+    });
+
+    const result = await fetchNewsfeedPageData();
+    expect(result.allTools).toEqual([sampleTool]);
+    expect(result.latestRanAtIso).toBe("2026-11-23T12:00:00.000Z");
+
+    const newsfeedCall = recordedCalls.find((c) => c.type === "newsfeedTools");
+    const syncCall = recordedCalls.find((c) => c.type === "latestSyncLog");
+    expect(newsfeedCall?.fromTable).toBe(tools);
+    expect(syncCall?.fromTable).toBe(syncLogs);
+    expect(syncCall?.limit).toBe(1);
+
+    setDbMockHandlers({
+      onNewsfeedTools: async () => [],
+      onLatestSyncLog: async () => [],
+    });
+
+    const emptyResult = await fetchNewsfeedPageData();
+    expect(emptyResult).toEqual({ allTools: [], latestRanAtIso: null });
   });
 });

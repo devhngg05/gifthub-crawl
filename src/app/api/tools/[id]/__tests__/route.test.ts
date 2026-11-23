@@ -9,6 +9,7 @@ import {
 } from "@/lib/auth";
 
 const {
+  mockRevalidateTag,
   mockSelectLimit,
   mockSelect,
   mockReturning,
@@ -16,6 +17,7 @@ const {
   mockSet,
   mockUpdate,
 } = vi.hoisted(() => {
+  const mockRevalidateTag = vi.fn();
   const mockSelectLimit = vi.fn();
   const mockSelectWhere = vi.fn(() => ({ limit: mockSelectLimit }));
   const mockFrom = vi.fn(() => ({ where: mockSelectWhere }));
@@ -29,6 +31,7 @@ const {
   });
   const mockUpdate = vi.fn(() => ({ set: mockSet }));
   return {
+    mockRevalidateTag,
     mockSelectLimit,
     mockSelect,
     mockReturning,
@@ -37,6 +40,10 @@ const {
     mockUpdate,
   };
 });
+
+vi.mock("next/cache", () => ({
+  revalidateTag: mockRevalidateTag,
+}));
 
 vi.mock("@/db", () => ({
   db: {
@@ -160,6 +167,7 @@ describe("PATCH /api/tools/[id]", () => {
     expect(expiredRes.status).toBe(401);
 
     expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockRevalidateTag).not.toHaveBeenCalled();
   });
 
   it("returns 403 on cross-origin PATCH even with a valid session cookie (CSRF protection)", async () => {
@@ -175,6 +183,7 @@ describe("PATCH /api/tools/[id]", () => {
 
     expect(res.status).toBe(403);
     expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockRevalidateTag).not.toHaveBeenCalled();
   });
 
   it("supports controlled x-admin-secret header fallback for internal scripts", async () => {
@@ -236,6 +245,7 @@ describe("PATCH /api/tools/[id]", () => {
       expect(json.error).toBe("Invalid tool id");
     }
     expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockRevalidateTag).not.toHaveBeenCalled();
   });
 
   it("returns 400 when request body is malformed JSON", async () => {
@@ -248,6 +258,7 @@ describe("PATCH /api/tools/[id]", () => {
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ error: "Invalid JSON body" });
     expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockRevalidateTag).not.toHaveBeenCalled();
   });
 
   it("returns 400 for empty body, forbidden extra fields, unknown subCategory, or oversized userNotes", async () => {
@@ -274,6 +285,7 @@ describe("PATCH /api/tools/[id]", () => {
       expect(json.details).toBeDefined();
     }
     expect(mockUpdate).not.toHaveBeenCalled();
+    expect(mockRevalidateTag).not.toHaveBeenCalled();
   });
 
   it("returns 404 when no tool matches the given id", async () => {
@@ -293,6 +305,7 @@ describe("PATCH /api/tools/[id]", () => {
     expect(await res.json()).toEqual({ error: "Tool not found" });
     expect(mockUpdate).toHaveBeenCalledTimes(1);
     expect(mockWhere).toHaveBeenCalledTimes(1);
+    expect(mockRevalidateTag).not.toHaveBeenCalled();
   });
 
   it("returns 200 when updating isPinned only using signed HttpOnly cookie without overwriting category/subCategory", async () => {
@@ -310,6 +323,8 @@ describe("PATCH /api/tools/[id]", () => {
     const res = await PATCH(req, ctx);
 
     expect(res.status).toBe(200);
+    expect(mockRevalidateTag).toHaveBeenCalledTimes(1);
+    expect(mockRevalidateTag).toHaveBeenCalledWith("tools", { expire: 0 });
     const json = await res.json();
     expect(json.tool.id).toBe(42);
     expect(json.tool.isPinned).toBe(true);
@@ -356,6 +371,13 @@ describe("PATCH /api/tools/[id]", () => {
     expect(res2.status).toBe(200);
     expect(getSetPayload(1).userNotes).toBeNull();
     expect(String(getSetPayload(1).searchText)).not.toContain("ghi chu cu");
+    expect(mockRevalidateTag).toHaveBeenCalledTimes(2);
+    expect(mockRevalidateTag).toHaveBeenNthCalledWith(1, "tools", {
+      expire: 0,
+    });
+    expect(mockRevalidateTag).toHaveBeenNthCalledWith(2, "tools", {
+      expire: 0,
+    });
   });
 
   it("returns 200 when updating subCategory and atomically syncs category, removes duplicate, and updates searchText", async () => {
@@ -384,6 +406,8 @@ describe("PATCH /api/tools/[id]", () => {
     const res = await PATCH(req, ctx);
 
     expect(res.status).toBe(200);
+    expect(mockRevalidateTag).toHaveBeenCalledTimes(1);
+    expect(mockRevalidateTag).toHaveBeenCalledWith("tools", { expire: 0 });
     const json = await res.json();
     expect(json.tool.category).toBe("dev-engineering");
     expect(json.tool.subCategory).toBe("database-orm");
@@ -463,6 +487,7 @@ describe("PATCH /api/tools/[id]", () => {
     const res = await PATCH(req, ctx);
 
     expect(res.status).toBe(500);
+    expect(mockRevalidateTag).not.toHaveBeenCalled();
     expect(await res.json()).toEqual({ error: "Internal server error" });
     expect(errorSpy).toHaveBeenCalledTimes(1);
     expect(errorSpy.mock.calls[0]?.[1]).toBe(
