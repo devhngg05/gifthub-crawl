@@ -2,6 +2,19 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.26] - 2026-11-23 (Tối ưu đếm Sidebar bằng `GROUP BY` & vá unhandled promise rejection trong `tools-page-query`)
+### Đã tối ưu & Sửa lỗi
+- **Gộp nhóm đếm Sidebar ngay trên PostgreSQL (`src/lib/queries/tools-page-query.ts`, `src/lib/ui-helpers.ts`):**
+  - Chuyển `fetchSidebarCountRows()` sang `fetchSidebarCountBuckets()` (giữ alias tương thích ngược `fetchSidebarCountRows`) với câu truy vấn `SELECT sub_category, is_pinned, count(*)::int AS count FROM tools GROUP BY sub_category, is_pinned`, loại bỏ việc tải toàn bộ các dòng trong bảng `tools` về Node.js để đếm.
+  - Mở rộng `ToolCountRow` (thêm `count?: number`), export `ToolCountBucket` và cập nhật `computeToolCounts()` cộng dồn theo trọng số bucket để cho kết quả 1–1 giống hệt dữ liệu thô (bao gồm `totalCount`, `pinnedCount`, `uncategorizedCount`, `categoryCounts`, `subCategoryCounts`) đồng thời bỏ qua bucket có `count <= 0` hoặc không hợp lệ.
+- **Khắc phục unhandled promise rejection trong `queryToolsPageData` (`src/lib/queries/tools-page-query.ts`):**
+  - Tách phần gọi `queryFilteredTools` kèm nhánh `catch` fallback `isMissingPgTrgmError` sang helper `queryFilteredToolsWithFallback()` và chạy song song với `fetchSidebarCountBuckets()` qua `Promise.all([...])`, bảo đảm mọi promise đều được gắn handler xử lý lỗi ngay lập tức.
+- **Đánh giá caching `fetchNewsfeedPageData()` (`src/app/newsfeed/page.tsx`):**
+  - Giữ `export const dynamic = "force-dynamic"` vì `/newsfeed` phụ thuộc `searchParams` và `new Date()`, đồng thời tránh giới hạn 2 MB của Next.js Data Cache / mất kiểu `Date` khi serialize toàn bộ `tools` cũng như tránh stale data khi worker `scripts/sync-tools.ts` cập nhật DB ngoài tiến trình Next.js.
+- **Kiểm thử (`src/lib/__tests__/ui-helpers.test.ts`, `src/lib/__tests__/tools-page-query.test.ts`):**
+  - Bổ sung unit test cho `computeToolCounts` với `ToolCountBucket`, kiểm chứng tương đương 100% giữa dữ liệu thô và dữ liệu đã `GROUP BY`, và edge cases (`[]`, `0`, số âm, `NaN`, số thập phân).
+  - Tạo mới `tools-page-query.test.ts` kiểm chứng SQL `GROUP BY` + `count(*)::int`, happy path, fallback Tầng 2 (`isRelaxedSearch`), fallback `isMissingPgTrgmError` (`42883`), rethrow lỗi gốc, và không phát sinh `unhandledRejection` ở cả hai chiều lỗi bất đồng bộ.
+
 ## [0.1.25] - 2026-11-23 (Vá edge case `classifier` & tách module `transport.ts` / `fallback.ts`)
 ### Đã sửa lỗi & Tái cấu trúc
 - **Cấu hình token batch cho `Groq-Qwen-27B` (`scripts/lib/classifier/providers.ts`):**

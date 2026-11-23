@@ -44,6 +44,13 @@ export interface ToolCountRow {
   subCategory: string;
   secondarySubCategories?: readonly string[];
   isPinned: boolean;
+  count?: number;
+}
+
+export interface ToolCountBucket {
+  subCategory: string;
+  isPinned: boolean;
+  count: number;
 }
 
 export interface ToolCounts {
@@ -353,27 +360,41 @@ export function hasActiveFilters(filters: ToolFilters): boolean {
 /**
  * Tổng hợp số lượng công cụ theo chuẩn kế toán 1–1 tuyệt đối từ `subCategory` chính:
  * - Mỗi công cụ chỉ đóng góp đúng 1 vào ngách chính (hoặc `uncategorized` nếu không thuộc 43 ngách chuẩn).
+ * - Hỗ trợ cả danh sách từng dòng (`count` mặc định là `1`) lẫn bucket đã `GROUP BY (subCategory, isPinned)` kèm `count`.
  * - Không cộng dồn `secondarySubCategories` vào số đếm Sidebar.
  * - `categoryCounts` bằng tổng `subCategoryCounts` của toàn bộ ngách con thuộc danh mục cha đó trong `TAXONOMY`.
  */
 export function computeToolCounts(rows: readonly ToolCountRow[]): ToolCounts {
   const categoryCounts: Record<string, number> = {};
   const subCategoryCounts: Record<string, number> = {};
+  let totalCount = 0;
   let pinnedCount = 0;
   let uncategorizedCount = 0;
 
   for (const row of rows) {
+    const weight =
+      row.count === undefined
+        ? 1
+        : Number.isFinite(row.count)
+          ? Math.max(0, Math.floor(row.count))
+          : 0;
+
+    if (weight === 0) {
+      continue;
+    }
+
+    totalCount += weight;
     if (row.isPinned) {
-      pinnedCount += 1;
+      pinnedCount += weight;
     }
 
     if (isValidSubCategory(row.subCategory)) {
       subCategoryCounts[row.subCategory] =
-        (subCategoryCounts[row.subCategory] ?? 0) + 1;
+        (subCategoryCounts[row.subCategory] ?? 0) + weight;
     } else {
-      uncategorizedCount += 1;
+      uncategorizedCount += weight;
       subCategoryCounts.uncategorized =
-        (subCategoryCounts.uncategorized ?? 0) + 1;
+        (subCategoryCounts.uncategorized ?? 0) + weight;
     }
   }
 
@@ -386,7 +407,7 @@ export function computeToolCounts(rows: readonly ToolCountRow[]): ToolCounts {
   }
 
   return {
-    totalCount: rows.length,
+    totalCount,
     pinnedCount,
     uncategorizedCount,
     categoryCounts,

@@ -17,6 +17,8 @@ import {
   parseToolSearchParams,
   parseUrlSearchParams,
   tokenizeSearchQuery,
+  type ToolCountBucket,
+  type ToolCountRow,
   type ToolFilters,
 } from "@/lib/ui-helpers";
 
@@ -374,6 +376,67 @@ describe("computeToolCounts", () => {
       0,
     );
     expect(totalCategorySum + counts.uncategorizedCount).toBe(counts.totalCount);
+  });
+
+  it("cộng dồn chính xác từ các bucket đã GROUP BY và cho kết quả giống hệt 100% so với dữ liệu từng dòng", () => {
+    const rawRows: ToolCountRow[] = [
+      { subCategory: "local-llm-gateway", isPinned: true },
+      { subCategory: "local-llm-gateway", isPinned: true },
+      { subCategory: "local-llm-gateway", isPinned: false },
+      { subCategory: "database-orm", isPinned: false },
+      { subCategory: "database-orm", isPinned: false },
+      { subCategory: "uncategorized", isPinned: true },
+      { subCategory: "legacy-deprecated-sub", isPinned: false },
+      { subCategory: "legacy-deprecated-sub", isPinned: false },
+    ];
+
+    const groupedBuckets: ToolCountBucket[] = [
+      { subCategory: "local-llm-gateway", isPinned: true, count: 2 },
+      { subCategory: "local-llm-gateway", isPinned: false, count: 1 },
+      { subCategory: "database-orm", isPinned: false, count: 2 },
+      { subCategory: "uncategorized", isPinned: true, count: 1 },
+      { subCategory: "legacy-deprecated-sub", isPinned: false, count: 2 },
+    ];
+
+    const countsFromRows = computeToolCounts(rawRows);
+    const countsFromBuckets = computeToolCounts(groupedBuckets);
+
+    expect(countsFromBuckets).toEqual(countsFromRows);
+    expect(countsFromBuckets.totalCount).toBe(8);
+    expect(countsFromBuckets.pinnedCount).toBe(3);
+    expect(countsFromBuckets.uncategorizedCount).toBe(3);
+    expect(countsFromBuckets.subCategoryCounts).toEqual({
+      "local-llm-gateway": 3,
+      "database-orm": 2,
+      uncategorized: 3,
+    });
+    expect(countsFromBuckets.categoryCounts["ai-llm"]).toBe(3);
+    expect(countsFromBuckets.categoryCounts["dev-engineering"]).toBe(2);
+  });
+
+  it("xử lý an toàn mảng rỗng và bucket có count bằng 0, âm, NaN hoặc thập phân", () => {
+    const emptyCounts = computeToolCounts([]);
+    expect(emptyCounts.totalCount).toBe(0);
+    expect(emptyCounts.pinnedCount).toBe(0);
+    expect(emptyCounts.uncategorizedCount).toBe(0);
+    expect(emptyCounts.subCategoryCounts).toEqual({});
+
+    const noisyCounts = computeToolCounts([
+      { subCategory: "database-orm", isPinned: true, count: 0 },
+      { subCategory: "ai-coding-agent", isPinned: true, count: -4 },
+      { subCategory: "cli-dev-env", isPinned: true, count: Number.NaN },
+      { subCategory: "local-llm-gateway", isPinned: false, count: 2.9 },
+      { subCategory: "unknown-legacy", isPinned: true, count: 0 },
+    ]);
+
+    expect(noisyCounts.totalCount).toBe(2);
+    expect(noisyCounts.pinnedCount).toBe(0);
+    expect(noisyCounts.uncategorizedCount).toBe(0);
+    expect(noisyCounts.subCategoryCounts).toEqual({
+      "local-llm-gateway": 2,
+    });
+    expect("database-orm" in noisyCounts.subCategoryCounts).toBe(false);
+    expect("uncategorized" in noisyCounts.subCategoryCounts).toBe(false);
   });
 });
 

@@ -15,19 +15,25 @@ import {
   computePagination,
   computeToolCounts,
   DEFAULT_PAGE_SIZE,
+  type ToolCountBucket,
   type ToolCounts,
   type ToolFilters,
 } from "@/lib/ui-helpers";
 
-/** Truy vấn nhẹ các cột phục vụ đếm số lượng 1–1 trên Sidebar (`totalCount`, `pinnedCount`, `uncategorizedCount`, từng nhóm/ngách). */
-export async function fetchSidebarCountRows() {
+/** Truy vấn gộp nhóm ngay trên PostgreSQL phục vụ đếm số lượng 1–1 trên Sidebar (`totalCount`, `pinnedCount`, `uncategorizedCount`, từng nhóm/ngách). */
+export async function fetchSidebarCountBuckets(): Promise<ToolCountBucket[]> {
   return db
     .select({
       subCategory: tools.subCategory,
       isPinned: tools.isPinned,
+      count: sql<number>`count(*)::int`,
     })
-    .from(tools);
+    .from(tools)
+    .groupBy(tools.subCategory, tools.isPinned);
 }
+
+/** Alias tương thích ngược cho `fetchSidebarCountBuckets`. */
+export const fetchSidebarCountRows = fetchSidebarCountBuckets;
 
 async function queryFilteredTools(params: {
   baseConditions: readonly SQL[];
@@ -126,9 +132,40 @@ async function queryFilteredTools(params: {
   };
 }
 
+async function queryFilteredToolsWithFallback(params: {
+  baseConditions: readonly SQL[];
+  filters: ToolFilters;
+  parsedQuery: ParsedSearchQuery;
+}): Promise<{
+  filteredTotal: number;
+  items: ToolRow[];
+  isRelaxedSearch: boolean;
+}> {
+  const { baseConditions, filters, parsedQuery } = params;
+
+  try {
+    return await queryFilteredTools({
+      baseConditions,
+      filters,
+      parsedQuery,
+      useTrgm: true,
+    });
+  } catch (error) {
+    if (isMissingPgTrgmError(error)) {
+      return queryFilteredTools({
+        baseConditions,
+        filters,
+        parsedQuery,
+        useTrgm: false,
+      });
+    }
+    throw error;
+  }
+}
+
 /**
  * Truy vấn dữ liệu trang chủ `/` từ Neon PostgreSQL:
- * chạy song song đếm Sidebar 1–1 và lọc/phân trang 2 tầng (tự fallback khi chưa bật `pg_trgm`).
+ * chạy song song đếm Sidebar 1–1 (đã GROUP BY) và lọc/phân trang 2 tầng (tự fallback khi chưa bật `pg_trgm`).
  */
 export async function queryToolsPageData(
   filters: ToolFilters,
@@ -140,38 +177,18 @@ export async function queryToolsPageData(
   counts: ToolCounts;
 }> {
   const baseConditions = buildToolBaseFilterConditions(filters);
-  const countRowsPromise = fetchSidebarCountRows();
-
-  let queryResult: {
-    filteredTotal: number;
-    items: ToolRow[];
-    isRelaxedSearch: boolean;
-  };
-
-  try {
-    queryResult = await queryFilteredTools({
+  const [queryResult, countBuckets] = await Promise.all([
+    queryFilteredToolsWithFallback({
       baseConditions,
       filters,
       parsedQuery,
-      useTrgm: true,
-    });
-  } catch (error) {
-    if (isMissingPgTrgmError(error)) {
-      queryResult = await queryFilteredTools({
-        baseConditions,
-        filters,
-        parsedQuery,
-        useTrgm: false,
-      });
-    } else {
-      throw error;
-    }
-  }
+    }),
+    fetchSidebarCountBuckets(),
+  ]);
 
-  const countRows = await countRowsPromise;
   return {
     ...queryResult,
-    counts: computeToolCounts(countRows),
+    counts: computeToolCounts(countBuckets),
   };
 }
 
