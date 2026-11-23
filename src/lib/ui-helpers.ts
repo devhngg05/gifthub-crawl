@@ -1,4 +1,5 @@
 import {
+  TAXONOMY,
   isValidCategory,
   isValidSubCategory,
   type CategorySlug,
@@ -9,7 +10,9 @@ import {
   type UsabilityLevel,
 } from "@/lib/validator";
 
-export type ToolSort = "stars" | "recent";
+export type ToolSort = "relevance" | "stars" | "recent" | "name";
+
+export const DEFAULT_PAGE_SIZE = 24;
 
 export interface ToolFilters {
   category?: CategorySlug | "other";
@@ -18,14 +21,28 @@ export interface ToolFilters {
   pinned: boolean;
   q: string;
   sort: ToolSort;
+  page: number;
 }
+
+export interface PaginationMeta {
+  currentPage: number;
+  totalPages: number;
+  pageSize: number;
+  offset: number;
+  startItem: number;
+  endItem: number;
+  hasPrev: boolean;
+  hasNext: boolean;
+}
+
+export type PaginationItem = number | "ellipsis";
 
 export type RawSearchParams = Record<string, string | string[] | undefined>;
 
 export interface ToolCountRow {
-  category: string;
+  category?: string;
   subCategory: string;
-  secondarySubCategories: string[];
+  secondarySubCategories?: readonly string[];
   isPinned: boolean;
 }
 
@@ -78,8 +95,23 @@ export function parseToolSearchParams(rawParams: RawSearchParams): ToolFilters {
 
   const q = (getSingleParam(rawParams.q) ?? "").trim();
 
-  const rawSort = getSingleParam(rawParams.sort)?.trim();
-  const sort: ToolSort = rawSort === "recent" ? "recent" : "stars";
+  const rawSort = getSingleParam(rawParams.sort)?.trim().toLowerCase();
+  const sort: ToolSort =
+    rawSort === "recent"
+      ? "recent"
+      : rawSort === "name"
+        ? "name"
+        : rawSort === "stars"
+          ? "stars"
+          : q
+            ? "relevance"
+            : "stars";
+
+  const rawPage = getSingleParam(rawParams.page)?.trim();
+  const parsedPage =
+    rawPage && /^\d+$/.test(rawPage) ? Number(rawPage) : Number.NaN;
+  const page =
+    Number.isSafeInteger(parsedPage) && parsedPage >= 1 ? parsedPage : 1;
 
   return {
     category,
@@ -88,7 +120,23 @@ export function parseToolSearchParams(rawParams: RawSearchParams): ToolFilters {
     pinned,
     q,
     sort,
+    page,
   };
+}
+
+/**
+ * Chuyển đổi `URLSearchParams` / `ReadonlyURLSearchParams` thành `ToolFilters` chuẩn hóa.
+ */
+export function parseUrlSearchParams(searchParams: {
+  entries(): IterableIterator<[string, string]>;
+}): ToolFilters {
+  const raw: RawSearchParams = {};
+  for (const [key, value] of searchParams.entries()) {
+    if (!(key in raw)) {
+      raw[key] = value;
+    }
+  }
+  return parseToolSearchParams(raw);
 }
 
 /**
@@ -120,6 +168,18 @@ export function buildFilterUrl(
     merged.subCategory = undefined;
   }
 
+  const hasFilterChange =
+    "category" in updates ||
+    "subCategory" in updates ||
+    "usability" in updates ||
+    "pinned" in updates ||
+    "q" in updates ||
+    "sort" in updates;
+
+  if (hasFilterChange && !("page" in updates)) {
+    merged.page = 1;
+  }
+
   const params = new URLSearchParams();
 
   if (merged.category) {
@@ -136,32 +196,165 @@ export function buildFilterUrl(
   }
 
   const trimmedQuery = merged.q.trim();
+
+  if ("q" in updates && !("sort" in updates)) {
+    if (!trimmedQuery && merged.sort === "relevance") {
+      merged.sort = "stars";
+    } else if (trimmedQuery && !current.q.trim() && merged.sort === "stars") {
+      merged.sort = "relevance";
+    }
+  }
+
+  if (!trimmedQuery && merged.sort === "relevance") {
+    merged.sort = "stars";
+  }
+
   if (trimmedQuery) {
     params.set("q", trimmedQuery);
   }
-  if (merged.sort === "recent") {
-    params.set("sort", "recent");
+
+  const defaultSortForUrl: ToolSort = trimmedQuery ? "relevance" : "stars";
+  if (merged.sort !== defaultSortForUrl) {
+    params.set("sort", merged.sort);
+  }
+
+  const safePage =
+    Number.isSafeInteger(merged.page) && merged.page > 1 ? merged.page : 1;
+  if (safePage > 1) {
+    params.set("page", String(safePage));
   }
 
   const queryString = params.toString();
   return queryString ? `/?${queryString}` : "/";
 }
 
+/**
+ * Tạo URL tìm kiếm toàn bộ kho sạch sẽ (`/?q=...`), xóa bỏ mọi bộ lọc danh mục, ngách, ghim, mức độ dùng, sort và page.
+ */
+export function buildGlobalSearchUrl(q: string): string {
+  const trimmed = q.trim();
+  if (!trimmed) {
+    return "/";
+  }
+  return `/?q=${encodeURIComponent(trimmed)}`;
+}
+
+/**
+ * Tạo URL điều hướng khi người dùng chọn một công cụ cụ thể từ dropdown gợi ý (`/?q=<fullName>`).
+ */
+export function buildSuggestedToolUrl(fullName: string): string {
+  return buildGlobalSearchUrl(fullName);
+}
+
+/**
+ * Tính toán thông số phân trang an toàn (tự kẹp `currentPage` trong `1..totalPages`).
+ */
+export function computePagination(
+  totalItems: number,
+  requestedPage: number,
+  pageSize: number = DEFAULT_PAGE_SIZE,
+): PaginationMeta {
+  const safePageSize = Number.isFinite(pageSize)
+    ? Math.max(1, Math.floor(pageSize))
+    : DEFAULT_PAGE_SIZE;
+  const safeTotal = Number.isFinite(totalItems)
+    ? Math.max(0, Math.floor(totalItems))
+    : 0;
+  const totalPages = Math.max(1, Math.ceil(safeTotal / safePageSize));
+  const normalizedRequested = Number.isFinite(requestedPage)
+    ? Math.max(1, Math.floor(requestedPage))
+    : 1;
+  const currentPage = Math.min(normalizedRequested, totalPages);
+  const offset = (currentPage - 1) * safePageSize;
+  const startItem = safeTotal === 0 ? 0 : offset + 1;
+  const endItem = Math.min(safeTotal, offset + safePageSize);
+
+  return {
+    currentPage,
+    totalPages,
+    pageSize: safePageSize,
+    offset,
+    startItem,
+    endItem,
+    hasPrev: currentPage > 1,
+    hasNext: currentPage < totalPages,
+  };
+}
+
+/**
+ * Tạo dải nút phân trang gọn (tối đa 7 mục gồm trang đầu, trang cuối, cửa sổ quanh trang hiện tại và `"ellipsis"`).
+ */
+export function getPaginationRange(
+  currentPage: number,
+  totalPages: number,
+): PaginationItem[] {
+  const safeTotalPages = Math.max(1, Math.floor(totalPages));
+  const safeCurrentPage = Math.min(
+    Math.max(1, Math.floor(currentPage)),
+    safeTotalPages,
+  );
+
+  if (safeTotalPages <= 7) {
+    return Array.from({ length: safeTotalPages }, (_, idx) => idx + 1);
+  }
+
+  const pages = new Set<number>([1, safeTotalPages]);
+  const windowStart = Math.max(2, safeCurrentPage - 1);
+  const windowEnd = Math.min(safeTotalPages - 1, safeCurrentPage + 1);
+
+  if (safeCurrentPage <= 3) {
+    pages.add(2);
+    pages.add(3);
+    pages.add(4);
+  } else if (safeCurrentPage >= safeTotalPages - 2) {
+    pages.add(safeTotalPages - 3);
+    pages.add(safeTotalPages - 2);
+    pages.add(safeTotalPages - 1);
+  } else {
+    for (let p = windowStart; p <= windowEnd; p += 1) {
+      pages.add(p);
+    }
+  }
+
+  const sortedPages = Array.from(pages)
+    .filter((p) => p >= 1 && p <= safeTotalPages)
+    .sort((a, b) => a - b);
+
+  const items: PaginationItem[] = [];
+  for (let i = 0; i < sortedPages.length; i += 1) {
+    const page = sortedPages[i];
+    const prev = sortedPages[i - 1];
+    if (prev !== undefined && page - prev > 1) {
+      if (page - prev === 2) {
+        items.push(prev + 1);
+      } else {
+        items.push("ellipsis");
+      }
+    }
+    items.push(page);
+  }
+
+  return items;
+}
+
 /** Kiểm tra có bất kỳ bộ lọc hoặc chế độ sắp xếp khác mặc định đang bật hay không. */
 export function hasActiveFilters(filters: ToolFilters): boolean {
+  const defaultSort: ToolSort = filters.q.trim() ? "relevance" : "stars";
   return Boolean(
     filters.category ||
       filters.subCategory ||
       filters.usability ||
       filters.pinned ||
       filters.q.trim() ||
-      filters.sort === "recent",
+      filters.sort !== defaultSort,
   );
 }
 
 /**
- * Tổng hợp số lượng công cụ theo nhóm lớn, ngách con (gồm cả nhãn chính & phụ không trùng lặp),
- * số lượng đã ghim và số lượng chưa phân loại từ dữ liệu thật trong DB.
+ * Tổng hợp số lượng công cụ theo chuẩn kế toán 1–1 tuyệt đối từ `subCategory` chính:
+ * - Mỗi công cụ chỉ đóng góp đúng 1 vào ngách chính (hoặc `uncategorized` nếu không thuộc 43 ngách chuẩn).
+ * - Không cộng dồn `secondarySubCategories` vào số đếm Sidebar.
+ * - `categoryCounts` bằng tổng `subCategoryCounts` của toàn bộ ngách con thuộc danh mục cha đó trong `TAXONOMY`.
  */
 export function computeToolCounts(rows: readonly ToolCountRow[]): ToolCounts {
   const categoryCounts: Record<string, number> = {};
@@ -173,27 +366,23 @@ export function computeToolCounts(rows: readonly ToolCountRow[]): ToolCounts {
     if (row.isPinned) {
       pinnedCount += 1;
     }
-    if (row.subCategory === "uncategorized") {
+
+    if (isValidSubCategory(row.subCategory)) {
+      subCategoryCounts[row.subCategory] =
+        (subCategoryCounts[row.subCategory] ?? 0) + 1;
+    } else {
       uncategorizedCount += 1;
+      subCategoryCounts.uncategorized =
+        (subCategoryCounts.uncategorized ?? 0) + 1;
     }
+  }
 
-    if (row.category) {
-      categoryCounts[row.category] = (categoryCounts[row.category] ?? 0) + 1;
+  for (const cat of TAXONOMY) {
+    let sum = 0;
+    for (const sub of cat.subCategories) {
+      sum += subCategoryCounts[sub.slug] ?? 0;
     }
-
-    const uniqueSubCategories = new Set<string>();
-    if (row.subCategory) {
-      uniqueSubCategories.add(row.subCategory);
-    }
-    for (const sec of row.secondarySubCategories ?? []) {
-      if (sec) {
-        uniqueSubCategories.add(sec);
-      }
-    }
-
-    for (const subSlug of uniqueSubCategories) {
-      subCategoryCounts[subSlug] = (subCategoryCounts[subSlug] ?? 0) + 1;
-    }
+    categoryCounts[cat.slug] = sum;
   }
 
   return {
@@ -273,4 +462,70 @@ export function formatRelativeTimeVi(
 /** Escape ký tự đặc biệt (`\`, `%`, `_`) trước khi đưa vào PostgreSQL `ILIKE ... ESCAPE '\'`. */
 export function escapeLikePattern(input: string): string {
   return input.replace(/[\\%_]/g, (char) => `\\${char}`);
+}
+
+/** Tách từ khóa tìm kiếm theo khoảng trắng, bỏ trùng không phân biệt hoa thường và giới hạn số từ. */
+export function tokenizeSearchQuery(
+  query: string,
+  maxTokens: number = 8,
+): string[] {
+  const trimmed = query.trim();
+  if (!trimmed || maxTokens <= 0) {
+    return [];
+  }
+
+  const limit = Math.floor(maxTokens);
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+
+  for (const part of trimmed.split(/\s+/)) {
+    if (!part) {
+      continue;
+    }
+    const normalized = part.toLowerCase();
+    if (seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    tokens.push(part);
+    if (tokens.length >= limit) {
+      break;
+    }
+  }
+
+  return tokens;
+}
+
+/** Chỉ cho phép URL ngoài dùng giao thức `https:` hoặc `http:`, trả về `"#"` nếu không hợp lệ. */
+export function getSafeExternalUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    return "#";
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+      return parsed.href;
+    }
+    return "#";
+  } catch {
+    return "#";
+  }
+}
+
+/** Ánh xạ mã trạng thái HTTP từ `PATCH /api/tools/[id]` sang thông báo tiếng Việt thân thiện. */
+export function mapToolPatchErrorMessage(status: number): string {
+  switch (status) {
+    case 400:
+      return "Dữ liệu gửi lên không hợp lệ.";
+    case 404:
+      return "Công cụ không còn tồn tại trong cơ sở dữ liệu.";
+    case 500:
+      return "Lỗi máy chủ nội bộ, vui lòng thử lại sau.";
+    case 503:
+      return "Máy chủ chưa cấu hình ADMIN_SECRET ở môi trường production.";
+    default:
+      return `Lỗi cập nhật (HTTP ${status}).`;
+  }
 }

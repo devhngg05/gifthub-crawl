@@ -92,19 +92,37 @@ describe("AiClassificationSchema", () => {
       expect(parsed.sub_category).toBe("ai-coding-agent");
     });
 
-    it("coerces unknown, missing, null, or non-string category to 'other' independently", () => {
+    it("coerces unknown, missing, null, or non-string category to 'other' when sub_category is uncategorized, and auto-syncs category when sub_category is valid", () => {
       for (const badCategory of ["blockchain", "other", "", null, 42]) {
-        const parsed = AiClassificationSchema.parse(
+        const uncategorizedParsed = AiClassificationSchema.parse(
+          makeValidAiPayload({
+            category: badCategory,
+            sub_category: "uncategorized",
+          }),
+        );
+        expect(uncategorizedParsed.category).toBe("other");
+        expect(uncategorizedParsed.sub_category).toBe("uncategorized");
+
+        const validSubParsed = AiClassificationSchema.parse(
           makeValidAiPayload({
             category: badCategory,
             sub_category: "api-client-testing",
           }),
         );
-        expect(parsed.category).toBe("other");
-        expect(parsed.sub_category).toBe("api-client-testing");
+        expect(validSubParsed.category).toBe("api-integration");
+        expect(validSubParsed.sub_category).toBe("api-client-testing");
       }
 
-      const missingCat = makeValidAiPayload();
+      const mismatchedParsed = AiClassificationSchema.parse(
+        makeValidAiPayload({
+          category: "ai-llm",
+          sub_category: "pentest-vuln-scanner",
+        }),
+      );
+      expect(mismatchedParsed.category).toBe("security-privacy");
+      expect(mismatchedParsed.sub_category).toBe("pentest-vuln-scanner");
+
+      const missingCat = makeValidAiPayload({ sub_category: "uncategorized" });
       delete (missingCat as Record<string, unknown>).category;
       expect(AiClassificationSchema.parse(missingCat).category).toBe("other");
     });

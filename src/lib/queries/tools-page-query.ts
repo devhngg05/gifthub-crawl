@@ -1,0 +1,223 @@
+import { and, desc, sql, type SQL } from "drizzle-orm";
+import { db } from "@/db";
+import { syncLogs, tools, type ToolRow } from "@/db/schema";
+import type { NewsfeedToolRow } from "@/lib/newsfeed";
+import type { ParsedSearchQuery } from "@/lib/search-engine";
+import {
+  buildRelaxedToolSearchCondition,
+  buildSearchRelevanceScore,
+  buildToolBaseFilterConditions,
+  buildToolOrderByClauses,
+  buildToolSearchCondition,
+  isMissingPgTrgmError,
+} from "@/lib/tool-query";
+import {
+  computePagination,
+  computeToolCounts,
+  DEFAULT_PAGE_SIZE,
+  type ToolCounts,
+  type ToolFilters,
+} from "@/lib/ui-helpers";
+
+/** Truy vấn nhẹ các cột phục vụ đếm số lượng 1–1 trên Sidebar (`totalCount`, `pinnedCount`, `uncategorizedCount`, từng nhóm/ngách). */
+export async function fetchSidebarCountRows() {
+  return db
+    .select({
+      subCategory: tools.subCategory,
+      isPinned: tools.isPinned,
+    })
+    .from(tools);
+}
+
+async function queryFilteredTools(params: {
+  baseConditions: readonly SQL[];
+  filters: ToolFilters;
+  parsedQuery: ParsedSearchQuery;
+  useTrgm: boolean;
+}): Promise<{
+  filteredTotal: number;
+  items: ToolRow[];
+  isRelaxedSearch: boolean;
+}> {
+  const { baseConditions, filters, parsedQuery, useTrgm } = params;
+  const hasQuery = parsedQuery.normalizedQuery.length > 0;
+  const relevanceScore = hasQuery
+    ? buildSearchRelevanceScore(parsedQuery, { useTrgm })
+    : undefined;
+  const orderByClauses = buildToolOrderByClauses(filters, { relevanceScore });
+
+  const strictSearchCond = hasQuery
+    ? buildToolSearchCondition(parsedQuery)
+    : undefined;
+  const strictWhereConditions = strictSearchCond
+    ? [...baseConditions, strictSearchCond]
+    : [...baseConditions];
+  const strictWhereClause =
+    strictWhereConditions.length > 0
+      ? and(...strictWhereConditions)
+      : undefined;
+
+  const strictCountRows = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(tools)
+    .where(strictWhereClause);
+
+  const strictTotal = strictCountRows[0]?.count ?? 0;
+
+  if (strictTotal > 0 || !hasQuery) {
+    const pagination = computePagination(
+      strictTotal,
+      filters.page,
+      DEFAULT_PAGE_SIZE,
+    );
+    const items =
+      strictTotal > 0
+        ? await db
+            .select()
+            .from(tools)
+            .where(strictWhereClause)
+            .orderBy(...orderByClauses)
+            .limit(DEFAULT_PAGE_SIZE)
+            .offset(pagination.offset)
+        : [];
+    return {
+      filteredTotal: strictTotal,
+      items,
+      isRelaxedSearch: false,
+    };
+  }
+
+  // Tầng 2 (Fallback tự động khi Tầng 1 trả về 0 kết quả)
+  const relaxedCond = buildRelaxedToolSearchCondition(parsedQuery, { useTrgm });
+  if (!relaxedCond) {
+    return { filteredTotal: 0, items: [], isRelaxedSearch: false };
+  }
+
+  const relaxedConditions = [...baseConditions, relaxedCond];
+  const relaxedWhereClause = and(...relaxedConditions);
+
+  const relaxedCountRows = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(tools)
+    .where(relaxedWhereClause);
+
+  const relaxedTotal = relaxedCountRows[0]?.count ?? 0;
+  if (relaxedTotal === 0) {
+    return { filteredTotal: 0, items: [], isRelaxedSearch: false };
+  }
+
+  const relaxedPagination = computePagination(
+    relaxedTotal,
+    filters.page,
+    DEFAULT_PAGE_SIZE,
+  );
+  const items = await db
+    .select()
+    .from(tools)
+    .where(relaxedWhereClause)
+    .orderBy(...orderByClauses)
+    .limit(DEFAULT_PAGE_SIZE)
+    .offset(relaxedPagination.offset);
+
+  return {
+    filteredTotal: relaxedTotal,
+    items,
+    isRelaxedSearch: true,
+  };
+}
+
+/**
+ * Truy vấn dữ liệu trang chủ `/` từ Neon PostgreSQL:
+ * chạy song song đếm Sidebar 1–1 và lọc/phân trang 2 tầng (tự fallback khi chưa bật `pg_trgm`).
+ */
+export async function queryToolsPageData(
+  filters: ToolFilters,
+  parsedQuery: ParsedSearchQuery,
+): Promise<{
+  filteredTotal: number;
+  items: ToolRow[];
+  isRelaxedSearch: boolean;
+  counts: ToolCounts;
+}> {
+  const baseConditions = buildToolBaseFilterConditions(filters);
+  const countRowsPromise = fetchSidebarCountRows();
+
+  let queryResult: {
+    filteredTotal: number;
+    items: ToolRow[];
+    isRelaxedSearch: boolean;
+  };
+
+  try {
+    queryResult = await queryFilteredTools({
+      baseConditions,
+      filters,
+      parsedQuery,
+      useTrgm: true,
+    });
+  } catch (error) {
+    if (isMissingPgTrgmError(error)) {
+      queryResult = await queryFilteredTools({
+        baseConditions,
+        filters,
+        parsedQuery,
+        useTrgm: false,
+      });
+    } else {
+      throw error;
+    }
+  }
+
+  const countRows = await countRowsPromise;
+  return {
+    ...queryResult,
+    counts: computeToolCounts(countRows),
+  };
+}
+
+/** Truy vấn toàn bộ công cụ (lược bỏ `searchText`) và thời điểm đồng bộ gần nhất cho trang `/newsfeed`. */
+export async function fetchNewsfeedPageData(): Promise<{
+  allTools: NewsfeedToolRow[];
+  latestRanAtIso: string | null;
+}> {
+  const [allTools, latestLogs] = await Promise.all([
+    db
+      .select({
+        id: tools.id,
+        githubId: tools.githubId,
+        name: tools.name,
+        fullName: tools.fullName,
+        htmlUrl: tools.htmlUrl,
+        stars: tools.stars,
+        language: tools.language,
+        lastPushedAt: tools.lastPushedAt,
+        readmeSha: tools.readmeSha,
+        summaryVi: tools.summaryVi,
+        category: tools.category,
+        subCategory: tools.subCategory,
+        secondarySubCategories: tools.secondarySubCategories,
+        useCases: tools.useCases,
+        replaces: tools.replaces,
+        usability: tools.usability,
+        isPinned: tools.isPinned,
+        userNotes: tools.userNotes,
+        createdAt: tools.createdAt,
+        updatedAt: tools.updatedAt,
+      })
+      .from(tools) satisfies Promise<NewsfeedToolRow[]>,
+    db
+      .select({ ranAt: syncLogs.ranAt })
+      .from(syncLogs)
+      .orderBy(desc(syncLogs.ranAt))
+      .limit(1),
+  ]);
+
+  const latestLog = latestLogs[0];
+  const latestRanAtIso = latestLog
+    ? latestLog.ranAt instanceof Date
+      ? latestLog.ranAt.toISOString()
+      : String(latestLog.ranAt)
+    : null;
+
+  return { allTools, latestRanAtIso };
+}

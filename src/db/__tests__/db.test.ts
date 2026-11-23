@@ -1,3 +1,10 @@
+import fs from "node:fs";
+import path from "node:path";
+import {
+  generateDrizzleJson,
+  generateMigration,
+  type DrizzleSnapshotJSON,
+} from "drizzle-kit/api";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -216,10 +223,10 @@ describe("Neon HTTP client initialization & lazy db proxy", () => {
 });
 
 describe("Drizzle PostgreSQL schema metadata", () => {
-  it("defines tools table with exact 20 columns, constraints, and defaults", () => {
+  it("defines tools table with exact 21 columns, constraints, and defaults", () => {
     const config = getTableConfig(tools);
     expect(config.name).toBe("tools");
-    expect(config.columns).toHaveLength(20);
+    expect(config.columns).toHaveLength(21);
 
     const byName = Object.fromEntries(
       config.columns.map((column) => [column.name, column]),
@@ -244,6 +251,7 @@ describe("Drizzle PostgreSQL schema metadata", () => {
       "usability",
       "is_pinned",
       "user_notes",
+      "search_text",
       "created_at",
       "updated_at",
     ]);
@@ -269,14 +277,30 @@ describe("Drizzle PostgreSQL schema metadata", () => {
       "category",
       "sub_category",
       "usability",
+      "search_text",
       "created_at",
       "updated_at",
     ]) {
       expect(byName[requiredCol].notNull).toBe(true);
     }
 
+    expect(byName.search_text.hasDefault).toBe(true);
+    expect(byName.search_text.default).toBe("");
+
     expect(byName.created_at.hasDefault).toBe(true);
     expect(byName.updated_at.hasDefault).toBe(true);
+
+    for (const tzCol of ["last_pushed_at", "created_at", "updated_at"]) {
+      const col = byName[tzCol] as {
+        withTimezone?: boolean;
+        getSQLType: () => string;
+      };
+      expect(col.withTimezone).toBe(true);
+      expect(col.getSQLType()).toBe("timestamp with time zone");
+    }
+
+    expect(typeof byName.updated_at.onUpdateFn).toBe("function");
+    expect(byName.updated_at.onUpdateFn?.()).toBeInstanceOf(Date);
 
     for (const arrayCol of [
       "secondary_sub_categories",
@@ -289,9 +313,18 @@ describe("Drizzle PostgreSQL schema metadata", () => {
     }
   });
 
-  it("defines 3 B-Tree indexes and 3 GIN indexes on tools", () => {
+  it("defines all B-Tree, composite sort, array GIN, and pg_trgm indexes on tools", () => {
     const config = getTableConfig(tools);
-    expect(config.indexes).toHaveLength(6);
+    expect(config.indexes).toHaveLength(10);
+
+    interface IndexColMeta {
+      name?: string;
+      indexConfig?: {
+        order?: "asc" | "desc";
+        nulls?: "first" | "last";
+        opClass?: string;
+      };
+    }
 
     const summarized = config.indexes.map((idx) => ({
       name: idx.config.name,
@@ -300,9 +333,25 @@ describe("Drizzle PostgreSQL schema metadata", () => {
       columns: idx.config.columns.map((col) =>
         "name" in col ? col.name : undefined,
       ),
+      columnMeta: idx.config.columns.map((col) => {
+        const meta = col as IndexColMeta;
+        return {
+          name: meta.name,
+          order: meta.indexConfig?.order,
+          nulls: meta.indexConfig?.nulls,
+          opClass: meta.indexConfig?.opClass,
+        };
+      }),
     }));
 
-    expect(summarized).toEqual([
+    expect(
+      summarized.map(({ name, method, unique, columns }) => ({
+        name,
+        method,
+        unique,
+        columns,
+      })),
+    ).toEqual([
       {
         name: "tools_category_idx",
         method: "btree",
@@ -339,10 +388,74 @@ describe("Drizzle PostgreSQL schema metadata", () => {
         unique: false,
         columns: ["replaces"],
       },
+      {
+        name: "tools_search_text_trgm_idx",
+        method: "gin",
+        unique: false,
+        columns: ["search_text"],
+      },
+      {
+        name: "tools_pinned_stars_pushed_idx",
+        method: "btree",
+        unique: false,
+        columns: ["is_pinned", "stars", "last_pushed_at", "id"],
+      },
+      {
+        name: "tools_last_pushed_at_idx",
+        method: "btree",
+        unique: false,
+        columns: ["last_pushed_at", "stars", "id"],
+      },
+      {
+        name: "tools_created_at_idx",
+        method: "btree",
+        unique: false,
+        columns: ["created_at"],
+      },
+    ]);
+
+    const byIndexName = Object.fromEntries(
+      summarized.map((item) => [item.name, item]),
+    );
+
+    expect(byIndexName.tools_search_text_trgm_idx.columnMeta).toEqual([
+      {
+        name: "search_text",
+        order: "asc",
+        nulls: "last",
+        opClass: "gin_trgm_ops",
+      },
+    ]);
+
+    expect(byIndexName.tools_pinned_stars_pushed_idx.columnMeta).toEqual([
+      { name: "is_pinned", order: "desc", nulls: "last", opClass: undefined },
+      { name: "stars", order: "desc", nulls: "last", opClass: undefined },
+      {
+        name: "last_pushed_at",
+        order: "desc",
+        nulls: "last",
+        opClass: undefined,
+      },
+      { name: "id", order: "desc", nulls: "last", opClass: undefined },
+    ]);
+
+    expect(byIndexName.tools_last_pushed_at_idx.columnMeta).toEqual([
+      {
+        name: "last_pushed_at",
+        order: "desc",
+        nulls: "last",
+        opClass: undefined,
+      },
+      { name: "stars", order: "desc", nulls: "last", opClass: undefined },
+      { name: "id", order: "desc", nulls: "last", opClass: undefined },
+    ]);
+
+    expect(byIndexName.tools_created_at_idx.columnMeta).toEqual([
+      { name: "created_at", order: "desc", nulls: "last", opClass: undefined },
     ]);
   });
 
-  it("defines sync_logs table with exact 7 columns, constraints, and defaults", () => {
+  it("defines sync_logs table with exact 7 columns, timestamptz ran_at, and ran_at DESC index", () => {
     const config = getTableConfig(syncLogs);
     expect(config.name).toBe("sync_logs");
     expect(config.columns).toHaveLength(7);
@@ -364,6 +477,10 @@ describe("Drizzle PostgreSQL schema metadata", () => {
     expect(byName.id.primary).toBe(true);
     expect(byName.ran_at.notNull).toBe(true);
     expect(byName.ran_at.hasDefault).toBe(true);
+    expect((byName.ran_at as { withTimezone?: boolean }).withTimezone).toBe(
+      true,
+    );
+    expect(byName.ran_at.getSQLType()).toBe("timestamp with time zone");
     expect(byName.error_summary.notNull).toBe(false);
 
     for (const counterCol of [
@@ -375,5 +492,104 @@ describe("Drizzle PostgreSQL schema metadata", () => {
       expect(byName[counterCol].notNull).toBe(true);
       expect(byName[counterCol].default).toBe(0);
     }
+
+    expect(config.indexes).toHaveLength(1);
+    const ranAtIndex = config.indexes[0];
+    expect(ranAtIndex.config.name).toBe("sync_logs_ran_at_idx");
+    expect(ranAtIndex.config.method ?? "btree").toBe("btree");
+    expect(ranAtIndex.config.unique).toBe(false);
+    expect(
+      ranAtIndex.config.columns.map((col) => {
+        const meta = col as {
+          name?: string;
+          indexConfig?: { order?: string; nulls?: string };
+        };
+        return {
+          name: meta.name,
+          order: meta.indexConfig?.order,
+          nulls: meta.indexConfig?.nulls,
+        };
+      }),
+    ).toEqual([{ name: "ran_at", order: "desc", nulls: "last" }]);
+  });
+});
+
+describe("Drizzle SQL migrations & zero schema drift", () => {
+  const drizzleDir = path.resolve(process.cwd(), "drizzle");
+  const journalPath = path.join(drizzleDir, "meta", "_journal.json");
+
+  interface JournalEntry {
+    idx: number;
+    tag: string;
+  }
+
+  interface DrizzleJournal {
+    entries: JournalEntry[];
+  }
+
+  it("contains valid migration journal, SQL files, and pg_trgm extension setup before trgm index", () => {
+    expect(fs.existsSync(journalPath)).toBe(true);
+    const journal = JSON.parse(
+      fs.readFileSync(journalPath, "utf8"),
+    ) as DrizzleJournal;
+    expect(journal.entries.length).toBeGreaterThanOrEqual(1);
+
+    for (const entry of journal.entries) {
+      const sqlFile = path.join(drizzleDir, `${entry.tag}.sql`);
+      const snapshotFile = path.join(
+        drizzleDir,
+        "meta",
+        `${String(entry.idx).padStart(4, "0")}_snapshot.json`,
+      );
+      expect(fs.existsSync(sqlFile)).toBe(true);
+      expect(fs.existsSync(snapshotFile)).toBe(true);
+    }
+
+    const firstMigrationSql = fs.readFileSync(
+      path.join(drizzleDir, `${journal.entries[0].tag}.sql`),
+      "utf8",
+    );
+
+    const extPos = firstMigrationSql.indexOf(
+      'CREATE EXTENSION IF NOT EXISTS "pg_trgm"',
+    );
+    const trgmIndexPos = firstMigrationSql.indexOf(
+      'CREATE INDEX "tools_search_text_trgm_idx"',
+    );
+    expect(extPos).toBeGreaterThanOrEqual(0);
+    expect(trgmIndexPos).toBeGreaterThan(extPos);
+
+    expect(firstMigrationSql).toContain("timestamp with time zone");
+    expect(firstMigrationSql).toContain("tools_pinned_stars_pushed_idx");
+    expect(firstMigrationSql).toContain("tools_last_pushed_at_idx");
+    expect(firstMigrationSql).toContain("tools_created_at_idx");
+    expect(firstMigrationSql).toContain("sync_logs_ran_at_idx");
+  });
+
+  it("has zero pending schema drift between src/db/schema.ts and latest Drizzle snapshot", async () => {
+    const journal = JSON.parse(
+      fs.readFileSync(journalPath, "utf8"),
+    ) as DrizzleJournal;
+    const latestEntry = journal.entries[journal.entries.length - 1];
+    expect(latestEntry).toBeDefined();
+
+    const latestSnapshotPath = path.join(
+      drizzleDir,
+      "meta",
+      `${String(latestEntry.idx).padStart(4, "0")}_snapshot.json`,
+    );
+    const latestSnapshot = JSON.parse(
+      fs.readFileSync(latestSnapshotPath, "utf8"),
+    ) as DrizzleSnapshotJSON;
+
+    const currentSnapshot = (await Promise.resolve(
+      generateDrizzleJson({ tools, syncLogs }),
+    )) as unknown as DrizzleSnapshotJSON;
+
+    const driftStatements = await generateMigration(
+      latestSnapshot,
+      currentSnapshot,
+    );
+    expect(driftStatements).toEqual([]);
   });
 });

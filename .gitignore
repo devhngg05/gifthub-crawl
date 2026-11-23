@@ -10,3 +10,6 @@ build/
 next-env.d.ts
 *.tsbuildinfo
 coverage/
+
+# Archives
+*.zip

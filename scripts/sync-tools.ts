@@ -2,58 +2,48 @@ import "./load-env";
 
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { db, type DatabaseClient } from "@/db";
-import { syncLogs, tools, type NewToolRow } from "@/db/schema";
-import type { AiClassification } from "@/lib/validator";
-import { classifyRepo } from "./lib/classifier";
+import { sanitizeErrorMessage } from "@/lib/sanitize-error";
+import { classifyRepo, classifyRepoBatch } from "./lib/classifier";
 import {
   fetchCandidateRepos,
   fetchCleanReadme,
+  fetchRepoMetadata,
   type GitHubRepoItem,
 } from "./lib/github";
+import {
+  runReclassifySync,
+  type SyncReclassifyMode,
+} from "./lib/sync/reclassify";
+import {
+  formatClassificationTable,
+  loadExistingToolsMap,
+  MAX_ERROR_SUMMARY_LENGTH,
+  recordSyncLog,
+  updateStarsAndMetadataOnly,
+  upsertClassifiedTool,
+  type ClassifiedRepoSummary,
+  type SyncLogger,
+  type SyncRunSummary,
+} from "./lib/sync/upsert";
+
+export * from "./lib/sync/upsert";
+export * from "./lib/sync/reclassify";
+export { sanitizeErrorMessage };
 
 export const DEFAULT_SYNC_LIMIT = 20;
-export const AI_RATE_LIMIT_DELAY_MS = 1500;
-const MAX_ERROR_SUMMARY_LENGTH = 4000;
-
-export type UpsertToolValues = Omit<
-  NewToolRow,
-  "id" | "isPinned" | "userNotes" | "createdAt"
-> & {
-  updatedAt: Date;
-};
-
-export type UpsertToolConflictSet = Omit<UpsertToolValues, "githubId">;
-
-export interface ClassifiedRepoSummary {
-  fullName: string;
-  provider: string;
-  subCategory: string;
-  usability: string;
-}
-
-export interface SyncRunSummary {
-  fetchedCount: number;
-  aiProcessedCount: number;
-  updatedStarsOnly: number;
-  failedCount: number;
-  errorSummary: string | null;
-  classified: ClassifiedRepoSummary[];
-}
-
-export interface SyncLogger {
-  info: (message: string) => void;
-  warn: (message: string) => void;
-  error: (message: string) => void;
-}
+export const DEFAULT_SYNC_BATCH_SIZE = 5;
+export const MAX_SYNC_BATCH_SIZE = 20;
+export const AI_RATE_LIMIT_DELAY_MS = 4000;
 
 export interface RunSyncOptions {
   db?: DatabaseClient;
   fetchCandidateRepos?: typeof fetchCandidateRepos;
   fetchCleanReadme?: typeof fetchCleanReadme;
+  fetchRepoMetadata?: typeof fetchRepoMetadata;
   classifyRepo?: typeof classifyRepo;
+  classifyRepoBatch?: typeof classifyRepoBatch;
   sleep?: (ms: number) => Promise<void>;
   env?: Record<string, string | undefined>;
   delayMs?: number;
@@ -62,6 +52,12 @@ export interface RunSyncOptions {
 }
 
 const SyncLimitSchema = z.coerce.number().int().positive();
+const SyncBatchSizeSchema = z.coerce
+  .number()
+  .int()
+  .min(1)
+  .max(MAX_SYNC_BATCH_SIZE);
+const SyncDelaySchema = z.coerce.number().int().nonnegative();
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -84,117 +80,58 @@ export function parseSyncLimit(rawValue?: string): number {
   return parsed.data;
 }
 
-/** Làm sạch thông điệp lỗi trước khi log hoặc lưu DB, che mọi secret/URL kết nối. */
-export function sanitizeErrorMessage(error: unknown): string {
-  const raw =
-    error instanceof Error
-      ? error.message
-      : typeof error === "string"
-        ? error
-        : String(error);
-
-  const redacted = raw
-    .replace(/postgres(?:ql)?:\/\/[^\s"'`]+/gi, "[REDACTED_DATABASE_URL]")
-    .replace(/Bearer\s+[^\s"'`]+/gi, "Bearer [REDACTED]")
-    .replace(
-      /\b(?:gsk|ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_-]+/g,
-      "[REDACTED_TOKEN]",
-    )
-    .replace(/\bgithub_pat_[A-Za-z0-9_]+/g, "[REDACTED_TOKEN]")
-    .replace(/\bsk-or-[A-Za-z0-9_-]+/g, "[REDACTED_TOKEN]")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return redacted.length > 0 ? redacted : "Unknown error";
-}
-
-/** Dựng payload chuẩn để chèn bản ghi tool mới vào bảng `tools`. */
-export function buildUpsertToolValues(
-  repo: GitHubRepoItem,
-  readmeSha: string | null,
-  classification: AiClassification,
-  now: Date,
-): UpsertToolValues {
-  return {
-    githubId: repo.id,
-    name: repo.name,
-    fullName: repo.full_name,
-    htmlUrl: repo.html_url,
-    stars: repo.stargazers_count,
-    language: repo.language,
-    lastPushedAt: new Date(repo.pushed_at),
-    readmeSha,
-    summaryVi: classification.summary_vi,
-    category: classification.category,
-    subCategory: classification.sub_category,
-    secondarySubCategories: classification.secondary_sub_categories,
-    useCases: classification.use_cases,
-    replaces: classification.replaces,
-    usability: classification.usability,
-    updatedAt: now,
-  };
-}
-
-/**
- * Dựng tập trường cập nhật khi trùng `githubId`.
- * Tuyệt đối loại trừ `isPinned`, `userNotes`, `id`, `githubId` và `createdAt`.
- */
-export function buildUpsertConflictSet(
-  values: UpsertToolValues,
-): UpsertToolConflictSet {
-  return {
-    name: values.name,
-    fullName: values.fullName,
-    htmlUrl: values.htmlUrl,
-    stars: values.stars,
-    language: values.language,
-    lastPushedAt: values.lastPushedAt,
-    readmeSha: values.readmeSha,
-    summaryVi: values.summaryVi,
-    category: values.category,
-    subCategory: values.subCategory,
-    secondarySubCategories: values.secondarySubCategories,
-    useCases: values.useCases,
-    replaces: values.replaces,
-    usability: values.usability,
-    updatedAt: values.updatedAt,
-  };
-}
-
-/** Định dạng bảng tóm tắt các repository vừa được phân loại AI. */
-export function formatClassificationTable(
-  rows: readonly ClassifiedRepoSummary[],
-): string {
-  if (rows.length === 0) {
-    return "Không có repository nào cần phân loại AI trong lượt chạy này.";
+/** Đọc và kiểm tra `SYNC_BATCH_SIZE` từ env (mặc định 5, hợp lệ 1..20). */
+export function parseSyncBatchSize(rawValue?: string): number {
+  if (rawValue === undefined || rawValue.trim() === "") {
+    return DEFAULT_SYNC_BATCH_SIZE;
   }
 
-  const headers = [
-    "Tên repo",
-    "Provider đã dùng",
-    "subCategory",
-    "usability",
-  ] as const;
+  const normalized = rawValue.trim();
+  const parsed = SyncBatchSizeSchema.safeParse(normalized);
+  if (!parsed.success) {
+    throw new Error(
+      `Invalid SYNC_BATCH_SIZE value "${normalized}": expected an integer between 1 and ${MAX_SYNC_BATCH_SIZE}`,
+    );
+  }
 
-  const widths: [number, number, number, number] = [
-    Math.max(headers[0].length, ...rows.map((r) => r.fullName.length)),
-    Math.max(headers[1].length, ...rows.map((r) => r.provider.length)),
-    Math.max(headers[2].length, ...rows.map((r) => r.subCategory.length)),
-    Math.max(headers[3].length, ...rows.map((r) => r.usability.length)),
-  ];
+  return parsed.data;
+}
 
-  const formatRow = (cols: readonly [string, string, string, string]): string =>
-    cols.map((col, idx) => col.padEnd(widths[idx])).join(" | ");
+/** Đọc và kiểm tra `SYNC_RECLASSIFY` (`none` mặc định | `uncategorized` | `all`). */
+export function parseSyncReclassifyMode(rawValue?: string): SyncReclassifyMode {
+  if (rawValue === undefined || rawValue.trim() === "") {
+    return "none";
+  }
 
-  const separator = widths.map((w) => "-".repeat(w)).join("-|-");
+  const normalized = rawValue.trim().toLowerCase();
+  if (
+    normalized === "none" ||
+    normalized === "uncategorized" ||
+    normalized === "all"
+  ) {
+    return normalized;
+  }
 
-  return [
-    formatRow(headers),
-    separator,
-    ...rows.map((r) =>
-      formatRow([r.fullName, r.provider, r.subCategory, r.usability]),
-    ),
-  ].join("\n");
+  throw new Error(
+    `Invalid SYNC_RECLASSIFY value "${rawValue.trim()}": expected "none", "uncategorized", or "all"`,
+  );
+}
+
+/** Đọc và kiểm tra `SYNC_DELAY_MS` từ env (mặc định 4000ms khi trống hoặc chưa khai báo). */
+export function parseSyncDelayMs(rawValue?: string): number {
+  if (rawValue === undefined || rawValue.trim() === "") {
+    return AI_RATE_LIMIT_DELAY_MS;
+  }
+
+  const normalized = rawValue.trim();
+  const parsed = SyncDelaySchema.safeParse(normalized);
+  if (!parsed.success) {
+    throw new Error(
+      `Invalid SYNC_DELAY_MS value "${normalized}": expected a non-negative integer`,
+    );
+  }
+
+  return parsed.data;
 }
 
 /** Kiểm tra file có đang được chạy trực tiếp qua CLI hay chỉ được import làm module. */
@@ -222,22 +159,7 @@ export function isDirectExecution(
   }
 }
 
-async function updateStarsAndMetadataOnly(
-  dbClient: DatabaseClient,
-  repo: GitHubRepoItem,
-  updatedAt: Date,
-): Promise<void> {
-  await dbClient
-    .update(tools)
-    .set({
-      stars: repo.stargazers_count,
-      lastPushedAt: new Date(repo.pushed_at),
-      updatedAt,
-    })
-    .where(eq(tools.githubId, repo.id));
-}
-
-/** Thực thi một lượt đồng bộ dữ liệu GitHub → AI Fallback → Neon PostgreSQL. */
+/** Thực thi một lượt đồng bộ dữ liệu GitHub → AI Fallback → Neon PostgreSQL (hỗ trợ cả `SYNC_RECLASSIFY`). */
 export async function runSync(
   options: RunSyncOptions = {},
 ): Promise<SyncRunSummary> {
@@ -245,10 +167,13 @@ export async function runSync(
   const fetchCandidatesImpl =
     options.fetchCandidateRepos ?? fetchCandidateRepos;
   const fetchCleanReadmeImpl = options.fetchCleanReadme ?? fetchCleanReadme;
+  const fetchRepoMetadataImpl = options.fetchRepoMetadata ?? fetchRepoMetadata;
   const classifyRepoImpl = options.classifyRepo ?? classifyRepo;
+  const classifyRepoBatchImpl =
+    options.classifyRepoBatch ?? classifyRepoBatch;
   const sleepImpl = options.sleep ?? defaultSleep;
   const env = options.env ?? process.env;
-  const delayMs = options.delayMs ?? AI_RATE_LIMIT_DELAY_MS;
+  const delayMs = options.delayMs ?? parseSyncDelayMs(env.SYNC_DELAY_MS);
   const now = options.now ?? (() => new Date());
   const logger: SyncLogger = options.logger ?? {
     info: (message) => console.log(message),
@@ -257,17 +182,35 @@ export async function runSync(
   };
 
   const syncLimit = parseSyncLimit(env.SYNC_LIMIT);
+  const syncBatchSize = parseSyncBatchSize(env.SYNC_BATCH_SIZE);
+  const reclassifyMode = parseSyncReclassifyMode(env.SYNC_RECLASSIFY);
+
+  if (reclassifyMode !== "none") {
+    return runReclassifySync({
+      mode: reclassifyMode,
+      dbClient,
+      fetchCleanReadmeImpl,
+      fetchRepoMetadataImpl,
+      classifyRepoBatchImpl,
+      sleepImpl,
+      delayMs,
+      syncLimit,
+      syncBatchSize,
+      now,
+      logger,
+    });
+  }
 
   let candidates: GitHubRepoItem[];
   try {
-    candidates = await fetchCandidatesImpl();
+    candidates = await fetchCandidatesImpl({ env });
   } catch (error) {
     const summary = sanitizeErrorMessage(error).slice(
       0,
       MAX_ERROR_SUMMARY_LENGTH,
     );
     try {
-      await dbClient.insert(syncLogs).values({
+      await recordSyncLog(dbClient, {
         fetchedCount: 0,
         aiProcessedCount: 0,
         updatedStarsOnly: 0,
@@ -284,22 +227,10 @@ export async function runSync(
   }
 
   const fetchedCount = candidates.length;
-  const existingMap = new Map<number, { readmeSha: string | null }>();
-
-  if (candidates.length > 0) {
-    const candidateIds = candidates.map((repo) => repo.id);
-    const existingRows = await dbClient
-      .select({
-        githubId: tools.githubId,
-        readmeSha: tools.readmeSha,
-      })
-      .from(tools)
-      .where(inArray(tools.githubId, candidateIds));
-
-    for (const row of existingRows) {
-      existingMap.set(row.githubId, { readmeSha: row.readmeSha });
-    }
-  }
+  logger.info(
+    `[sync-tools] Đã tìm thấy ${fetchedCount} ứng viên, đang đối chiếu DB...`,
+  );
+  const existingMap = await loadExistingToolsMap(dbClient, candidates);
 
   let aiAttemptedCount = 0;
   let aiProcessedCount = 0;
@@ -307,55 +238,75 @@ export async function runSync(
   let failedCount = 0;
   const errors: string[] = [];
   const classified: ClassifiedRepoSummary[] = [];
+  const providerCooldowns = new Map<string, number>();
 
   for (const repo of candidates) {
     try {
       const existing = existingMap.get(repo.id);
 
-      // Repo mới nhưng đã chạm SYNC_LIMIT: bỏ qua sớm để tiết kiệm GitHub/AI quota.
+      // Repo mới nhưng đã chạm SYNC_LIMIT: dừng vòng lặp sớm cho sạch log và tiết kiệm quota.
       if (!existing && aiAttemptedCount >= syncLimit) {
+        logger.info(
+          `[sync-tools] Reached SYNC_LIMIT (${syncLimit}) at new repo ${repo.full_name}; stopping loop early.`,
+        );
+        break;
+      }
+
+      // Repo đã tồn tại và đã chạm SYNC_LIMIT: chỉ cập nhật stars/lastPushedAt mà không tốn request README/AI,
+      // giữ nguyên readmeSha cũ để lượt sau tự động phân loại lại nếu có thay đổi.
+      if (existing !== undefined && aiAttemptedCount >= syncLimit) {
+        await updateStarsAndMetadataOnly(dbClient, repo, now());
+        updatedStarsOnly += 1;
         continue;
       }
 
       const readme = await fetchCleanReadmeImpl(repo.full_name);
 
-      // Idempotency theo readmeSha HOẶC repo cũ đổi SHA sau khi đã chạm SYNC_LIMIT:
-      // chỉ cập nhật stars/lastPushedAt/updatedAt, giữ nguyên readmeSha cũ để lượt sau phân loại lại.
-      if (
-        existing !== undefined &&
-        (existing.readmeSha === readme.sha || aiAttemptedCount >= syncLimit)
-      ) {
+      // Idempotency theo readmeSha: không đổi thì chỉ cập nhật stars/lastPushedAt/updatedAt.
+      if (existing !== undefined && existing.readmeSha === readme.sha) {
         await updateStarsAndMetadataOnly(dbClient, repo, now());
         updatedStarsOnly += 1;
         continue;
       }
 
       aiAttemptedCount += 1;
+      if ((aiAttemptedCount - 1) % syncBatchSize === 0) {
+        const batchNumber =
+          Math.floor((aiAttemptedCount - 1) / syncBatchSize) + 1;
+        const batchSize = Math.min(
+          syncBatchSize,
+          syncLimit - (batchNumber - 1) * syncBatchSize,
+        );
+        logger.info(
+          `[sync-tools] Đang tải README & phân loại lô ${batchNumber} (${batchSize} repo)...`,
+        );
+      }
 
-      const { classification, provider } = await classifyRepoImpl({
-        name: repo.name,
-        fullName: repo.full_name,
-        description: repo.description ?? "",
-        language: repo.language,
-        topics: repo.topics,
-        readmeText: readme.text,
-      });
+      const { classification, provider } = await classifyRepoImpl(
+        {
+          name: repo.name,
+          fullName: repo.full_name,
+          description: repo.description ?? "",
+          homepage: repo.homepage ?? null,
+          language: repo.language,
+          topics: repo.topics,
+          readmeText: readme.text,
+        },
+        {
+          providerCooldowns,
+          sleep: sleepImpl,
+          now: () => now().getTime(),
+        },
+      );
 
-      const values = buildUpsertToolValues(
+      await upsertClassifiedTool(
+        dbClient,
         repo,
         readme.sha,
         classification,
         now(),
+        existing?.userNotes ?? null,
       );
-      const conflictSet = buildUpsertConflictSet(values);
-
-      await dbClient
-        .insert(tools)
-        .values(values)
-        .onConflictDoUpdate({
-          target: tools.githubId,
-          set: conflictSet,
-        });
 
       aiProcessedCount += 1;
       classified.push({
@@ -364,6 +315,10 @@ export async function runSync(
         subCategory: classification.sub_category,
         usability: classification.usability,
       });
+
+      logger.info(
+        `[sync-tools] [${aiProcessedCount}/${syncLimit}] ${repo.full_name} -> ${classification.sub_category} (${provider})`,
+      );
 
       await sleepImpl(delayMs);
     } catch (error) {
@@ -379,7 +334,7 @@ export async function runSync(
       ? errors.join(" | ").slice(0, MAX_ERROR_SUMMARY_LENGTH)
       : null;
 
-  await dbClient.insert(syncLogs).values({
+  await recordSyncLog(dbClient, {
     fetchedCount,
     aiProcessedCount,
     updatedStarsOnly,

@@ -3,7 +3,19 @@ import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolRow } from "@/db/schema";
 
-const { mockReturning, mockWhere, mockSet, mockUpdate } = vi.hoisted(() => {
+const {
+  mockSelectLimit,
+  mockSelect,
+  mockReturning,
+  mockWhere,
+  mockSet,
+  mockUpdate,
+} = vi.hoisted(() => {
+  const mockSelectLimit = vi.fn();
+  const mockSelectWhere = vi.fn(() => ({ limit: mockSelectLimit }));
+  const mockFrom = vi.fn(() => ({ where: mockSelectWhere }));
+  const mockSelect = vi.fn(() => ({ from: mockFrom }));
+
   const mockReturning = vi.fn();
   const mockWhere = vi.fn(() => ({ returning: mockReturning }));
   const mockSet = vi.fn((values: Record<string, unknown>) => {
@@ -11,11 +23,19 @@ const { mockReturning, mockWhere, mockSet, mockUpdate } = vi.hoisted(() => {
     return { where: mockWhere };
   });
   const mockUpdate = vi.fn(() => ({ set: mockSet }));
-  return { mockReturning, mockWhere, mockSet, mockUpdate };
+  return {
+    mockSelectLimit,
+    mockSelect,
+    mockReturning,
+    mockWhere,
+    mockSet,
+    mockUpdate,
+  };
 });
 
 vi.mock("@/db", () => ({
   db: {
+    select: mockSelect,
     update: mockUpdate,
   },
 }));
@@ -43,6 +63,7 @@ function makeToolRow(overrides: Partial<ToolRow> = {}): ToolRow {
     usability: "dev-required",
     isPinned: false,
     userNotes: null,
+    searchText: "drizzle orm drizzle team drizzle orm",
     createdAt: now,
     updatedAt: now,
     ...overrides,
@@ -207,9 +228,12 @@ describe("PATCH /api/tools/[id]", () => {
     expect("category" in setPayload).toBe(false);
     expect("subCategory" in setPayload).toBe(false);
     expect("secondarySubCategories" in setPayload).toBe(false);
+    expect("searchText" in setPayload).toBe(false);
+    expect(mockSelect).not.toHaveBeenCalled();
   });
 
-  it("returns 200 when updating userNotes with a string or null", async () => {
+  it("returns 200 when updating userNotes with a string or null and recalculates searchText", async () => {
+    mockSelectLimit.mockResolvedValueOnce([makeToolRow()]);
     mockReturning.mockResolvedValueOnce([
       makeToolRow({ userNotes: "Dùng cho backend dự án mới" }),
     ]);
@@ -222,7 +246,11 @@ describe("PATCH /api/tools/[id]", () => {
     const res1 = await PATCH(req1, ctx1);
     expect(res1.status).toBe(200);
     expect(getSetPayload(0).userNotes).toBe("Dùng cho backend dự án mới");
+    expect(String(getSetPayload(0).searchText)).toContain("dung cho backend du an moi");
 
+    mockSelectLimit.mockResolvedValueOnce([
+      makeToolRow({ userNotes: "Ghi chú cũ" }),
+    ]);
     mockReturning.mockResolvedValueOnce([makeToolRow({ userNotes: null })]);
     const [req2, ctx2] = makePatchRequest(
       "42",
@@ -232,9 +260,11 @@ describe("PATCH /api/tools/[id]", () => {
     const res2 = await PATCH(req2, ctx2);
     expect(res2.status).toBe(200);
     expect(getSetPayload(1).userNotes).toBeNull();
+    expect(String(getSetPayload(1).searchText)).not.toContain("ghi chu cu");
   });
 
-  it("returns 200 when updating subCategory and atomically syncs category and removes duplicate from secondarySubCategories", async () => {
+  it("returns 200 when updating subCategory and atomically syncs category, removes duplicate, and updates searchText", async () => {
+    mockSelectLimit.mockResolvedValueOnce([makeToolRow()]);
     const updatedRow = makeToolRow({
       isPinned: true,
       userNotes: "Cập nhật phân loại chuẩn",
@@ -268,6 +298,8 @@ describe("PATCH /api/tools/[id]", () => {
     expect(setPayload.userNotes).toBe("Cập nhật phân loại chuẩn");
     expect(setPayload.subCategory).toBe("database-orm");
     expect(setPayload.category).toBe("dev-engineering");
+    expect(String(setPayload.searchText)).toContain("database orm");
+    expect(String(setPayload.searchText)).toContain("cap nhat phan loai chuan");
     expect(setPayload.updatedAt).toBeInstanceOf(Date);
 
     const compiled = new PgDialect().sqlToQuery(
@@ -282,6 +314,7 @@ describe("PATCH /api/tools/[id]", () => {
   });
 
   it("returns 200 when updating subCategory alone across category boundaries", async () => {
+    mockSelectLimit.mockResolvedValueOnce([makeToolRow()]);
     const updatedRow = makeToolRow({
       category: "ai-llm",
       subCategory: "ai-coding-agent",
@@ -304,13 +337,18 @@ describe("PATCH /api/tools/[id]", () => {
     const setPayload = getSetPayload(0);
     expect(setPayload.subCategory).toBe("ai-coding-agent");
     expect(setPayload.category).toBe("ai-llm");
+    expect(String(setPayload.searchText)).toContain("ai coding agent");
     expect(setPayload.updatedAt).toBeInstanceOf(Date);
     expect("isPinned" in setPayload).toBe(false);
     expect("userNotes" in setPayload).toBe(false);
   });
 
-  it("returns 500 when database throws an unexpected error", async () => {
-    mockReturning.mockRejectedValueOnce(new Error("Connection timeout"));
+  it("returns 500 when database throws an unexpected error and redacts credentials in logs", async () => {
+    mockReturning.mockRejectedValueOnce(
+      new Error(
+        "Connection failed for postgresql://admin:topsecret@ep-demo.neon.tech/neondb?sslmode=require",
+      ),
+    );
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const [req, ctx] = makePatchRequest(
@@ -323,5 +361,9 @@ describe("PATCH /api/tools/[id]", () => {
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: "Internal server error" });
     expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0]?.[1]).toBe(
+      "Connection failed for [REDACTED_DATABASE_URL]",
+    );
+    expect(String(errorSpy.mock.calls[0]?.[1])).not.toContain("topsecret");
   });
 });

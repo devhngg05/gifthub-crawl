@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   isValidCategory,
   isValidSubCategory,
+  SUB_CATEGORY_MAP,
   VALID_SUB_CATEGORIES,
   type CategorySlug,
   type SubCategorySlug,
@@ -118,18 +119,25 @@ export const AiClassificationSchema = z
       z.enum(VALID_USABILITY_LEVELS).catch("dev-required"),
     ),
   })
-  .transform(({ secondary_sub_categories, ...rest }) => ({
-    summary_vi: rest.summary_vi,
-    category: rest.category,
-    sub_category: rest.sub_category,
-    secondary_sub_categories: sanitizeSecondarySubCategories(
-      secondary_sub_categories,
-      rest.sub_category,
-    ),
-    use_cases: rest.use_cases,
-    replaces: rest.replaces,
-    usability: rest.usability,
-  }));
+  .transform(({ secondary_sub_categories, ...rest }) => {
+    const syncedCategory: CategorySlug | "other" =
+      rest.sub_category !== "uncategorized"
+        ? SUB_CATEGORY_MAP[rest.sub_category].category
+        : rest.category;
+
+    return {
+      summary_vi: rest.summary_vi,
+      category: syncedCategory,
+      sub_category: rest.sub_category,
+      secondary_sub_categories: sanitizeSecondarySubCategories(
+        secondary_sub_categories,
+        rest.sub_category,
+      ),
+      use_cases: rest.use_cases,
+      replaces: rest.replaces,
+      usability: rest.usability,
+    };
+  });
 
 export type AiClassification = z.infer<typeof AiClassificationSchema>;
 

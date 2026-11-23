@@ -1,5 +1,5 @@
+import type { Metadata } from "next";
 import Link from "next/link";
-import { desc } from "drizzle-orm";
 import {
   Activity,
   AlertTriangle,
@@ -7,46 +7,42 @@ import {
   CheckCircle2,
   Clock,
   Database,
+  Flame,
   HelpCircle,
   Pin,
 } from "lucide-react";
 import { RelativeTime } from "@/components/RelativeTime";
-import { db } from "@/db";
-import { syncLogs, tools } from "@/db/schema";
-import { computeToolCounts } from "@/lib/ui-helpers";
+import { fetchLogsPageData } from "@/lib/queries/logs-query";
 
 export const dynamic = "force-dynamic";
 
-export default async function LogsPage() {
-  const [logs, countRows] = await Promise.all([
-    db.select().from(syncLogs).orderBy(desc(syncLogs.ranAt)).limit(30),
-    db
-      .select({
-        category: tools.category,
-        subCategory: tools.subCategory,
-        secondarySubCategories: tools.secondarySubCategories,
-        isPinned: tools.isPinned,
-      })
-      .from(tools),
-  ]);
+export const metadata: Metadata = {
+  title: "Nhật ký đồng bộ",
+  description:
+    "Theo dõi trạng thái, số lượng đồng bộ và chi tiết lỗi của worker Gifthub Crawl trên Neon PostgreSQL.",
+  robots: {
+    index: false,
+    follow: false,
+  },
+};
 
-  const counts = computeToolCounts(countRows);
-  const latestLog = logs[0];
+export default async function LogsPage() {
+  const { logs, counts, latestLog } = await fetchLogsPageData(30);
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100">
+    <div className="min-h-dvh overflow-x-clip bg-zinc-950 text-zinc-100">
       <main className="mx-auto max-w-6xl space-y-6 px-4 py-8 sm:px-6 lg:px-8">
         {/* Top bar */}
         <header className="flex flex-wrap items-center justify-between gap-4 border-b border-zinc-800/80 pb-5">
-          <div className="space-y-1">
+          <div className="min-w-0 space-y-1">
             <div className="flex items-center gap-2 text-emerald-400">
-              <Activity className="h-5 w-5" />
+              <Activity className="h-5 w-5 shrink-0" />
               <span className="text-xs font-semibold uppercase tracking-wider">
-                Worker Telemetry
+                Giám sát Worker
               </span>
             </div>
-            <h1 className="text-2xl font-bold tracking-tight text-zinc-100">
-              Nhật ký đồng bộ (Sync Logs)
+            <h1 className="font-display text-2xl font-bold tracking-tight text-zinc-100">
+              Nhật ký đồng bộ
             </h1>
             <p className="text-sm text-zinc-400">
               Theo dõi 30 phiên chạy gần nhất của{" "}
@@ -57,13 +53,22 @@ export default async function LogsPage() {
             </p>
           </div>
 
-          <Link
-            href="/"
-            className="inline-flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900 px-3.5 py-2 text-sm font-medium text-zinc-200 transition-colors hover:border-emerald-500/40 hover:text-emerald-300"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            <span>Quay lại Radar</span>
-          </Link>
+          <div className="flex flex-wrap items-center gap-2">
+            <Link
+              href="/newsfeed"
+              className="inline-flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-sm font-medium text-emerald-300 transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
+            >
+              <Flame className="h-4 w-4 text-emerald-400" />
+              <span>Newsfeed</span>
+            </Link>
+            <Link
+              href="/"
+              className="inline-flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900 px-3.5 py-2 text-sm font-medium text-zinc-200 transition-colors hover:border-emerald-500/40 hover:text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              <span>Quay lại Gifthub Crawl</span>
+            </Link>
+          </div>
         </header>
 
         {/* Summary stat cards */}
@@ -76,7 +81,7 @@ export default async function LogsPage() {
               <span>Tổng số công cụ</span>
               <Database className="h-4 w-4 text-emerald-400" />
             </div>
-            <p className="mt-2 font-mono text-2xl font-bold text-zinc-100">
+            <p className="mt-2 font-mono text-2xl font-bold tabular-nums text-zinc-100">
               {counts.totalCount}
             </p>
           </div>
@@ -86,7 +91,7 @@ export default async function LogsPage() {
               <span>Công cụ đã ghim</span>
               <Pin className="h-4 w-4 text-emerald-400" />
             </div>
-            <p className="mt-2 font-mono text-2xl font-bold text-zinc-100">
+            <p className="mt-2 font-mono text-2xl font-bold tabular-nums text-zinc-100">
               {counts.pinnedCount}
             </p>
           </div>
@@ -96,7 +101,7 @@ export default async function LogsPage() {
               <span>Chưa phân loại</span>
               <HelpCircle className="h-4 w-4 text-amber-400" />
             </div>
-            <p className="mt-2 font-mono text-2xl font-bold text-zinc-100">
+            <p className="mt-2 font-mono text-2xl font-bold tabular-nums text-zinc-100">
               {counts.uncategorizedCount}
             </p>
           </div>
@@ -116,7 +121,7 @@ export default async function LogsPage() {
                   }
                 />
               ) : (
-                <span className="text-sm text-zinc-500">Chưa chạy</span>
+                <span className="text-sm text-zinc-400">Chưa chạy</span>
               )}
             </div>
           </div>
@@ -133,10 +138,11 @@ export default async function LogsPage() {
                 Chưa có bản ghi nào trong bảng{" "}
                 <code className="font-mono text-zinc-200">sync_logs</code>.
               </p>
-              <p className="mt-1 text-xs text-zinc-500">
+              <p className="mt-1 text-xs text-zinc-400">
                 Chạy{" "}
                 <code className="font-mono text-zinc-300">npm run sync</code>{" "}
-                hoặc kích hoạt GitHub Actions để ghi nhận lịch sử đồng bộ đầu tiên.
+                hoặc kích hoạt GitHub Actions để ghi nhận lịch sử đồng bộ đầu
+                tiên.
               </p>
             </div>
           ) : (
@@ -144,12 +150,24 @@ export default async function LogsPage() {
               <table className="w-full border-collapse text-left text-sm">
                 <thead>
                   <tr className="border-b border-zinc-800 bg-zinc-900/80 text-xs font-semibold uppercase tracking-wider text-zinc-400">
-                    <th className="px-4 py-3">Thời gian chạy</th>
-                    <th className="px-4 py-3 text-right">Fetched</th>
-                    <th className="px-4 py-3 text-right">AI Processed</th>
-                    <th className="px-4 py-3 text-right">Stars Only</th>
-                    <th className="px-4 py-3 text-right">Failed</th>
-                    <th className="px-4 py-3">Chi tiết lỗi</th>
+                    <th scope="col" className="px-4 py-3">
+                      Thời gian chạy
+                    </th>
+                    <th scope="col" className="px-4 py-3 text-right">
+                      Đã thu thập
+                    </th>
+                    <th scope="col" className="px-4 py-3 text-right">
+                      Phân loại AI
+                    </th>
+                    <th scope="col" className="px-4 py-3 text-right">
+                      Chỉ cập nhật sao
+                    </th>
+                    <th scope="col" className="px-4 py-3 text-right">
+                      Lỗi
+                    </th>
+                    <th scope="col" className="px-4 py-3">
+                      Chi tiết lỗi
+                    </th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-800/80">
@@ -170,27 +188,27 @@ export default async function LogsPage() {
                             <span className="font-medium text-zinc-200">
                               <RelativeTime isoDate={ranAtIso} />
                             </span>
-                            <span className="font-mono text-[11px] text-zinc-500">
+                            <span className="font-mono text-[11px] tabular-nums text-zinc-400">
                               {ranAtIso.replace("T", " ").slice(0, 19)} UTC
                             </span>
                           </div>
                         </td>
 
-                        <td className="whitespace-nowrap px-4 py-3.5 text-right font-mono text-zinc-200">
+                        <td className="whitespace-nowrap px-4 py-3.5 text-right font-mono tabular-nums text-zinc-200">
                           {log.fetchedCount}
                         </td>
 
-                        <td className="whitespace-nowrap px-4 py-3.5 text-right font-mono text-emerald-300">
+                        <td className="whitespace-nowrap px-4 py-3.5 text-right font-mono tabular-nums text-emerald-300">
                           {log.aiProcessedCount}
                         </td>
 
-                        <td className="whitespace-nowrap px-4 py-3.5 text-right font-mono text-sky-300">
+                        <td className="whitespace-nowrap px-4 py-3.5 text-right font-mono tabular-nums text-sky-300">
                           {log.updatedStarsOnly}
                         </td>
 
                         <td className="whitespace-nowrap px-4 py-3.5 text-right">
                           <span
-                            className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-xs font-medium ${
+                            className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-xs font-medium tabular-nums ${
                               hasFailure
                                 ? "border-red-500/40 bg-red-500/15 text-red-300"
                                 : "border-emerald-500/20 bg-emerald-500/10 text-emerald-400"
@@ -207,11 +225,11 @@ export default async function LogsPage() {
 
                         <td className="max-w-md px-4 py-3.5">
                           {log.errorSummary ? (
-                            <pre className="max-h-28 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-red-500/20 bg-red-950/20 p-2 font-mono text-xs text-red-200">
+                            <pre className="max-h-28 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-red-500/20 bg-red-950/20 p-2 font-mono text-xs text-red-200 [overflow-wrap:anywhere]">
                               {log.errorSummary}
                             </pre>
                           ) : (
-                            <span className="text-xs text-zinc-500">
+                            <span className="text-xs text-zinc-400">
                               Không có lỗi
                             </span>
                           )}

@@ -19,6 +19,9 @@
    - Idempotency theo `readmeSha`, bảo toàn `isPinned` và `userNotes` khi UPSERT, bỏ qua không upsert vào `tools` nếu cả 4 AI provider đều thất bại.
 4. **Trang giám sát (`/logs`):**
    - Hiển thị thống kê tổng quan (tổng số công cụ, số lượng `uncategorized`, lần đồng bộ gần nhất) và bảng lịch sử từ `sync_logs`.
+5. **Trang Newsfeed (`/newsfeed`):**
+   - Server Component (`force-dynamic`) thiết kế theo phong cách editorial minimalist (`max-w-4xl`), đọc dữ liệu thật từ Neon PostgreSQL (`tools`, `sync_logs`), tính `computeRadarScore(tool, now)` cho thứ tự hiển thị và `computeQualityRating(tool, now)` (`0..3` sao vàng dựa trên `computeIntrinsicScore` không cộng `createdAt` để chống lạm phát sao), kèm `selectDiverseTools()` chống độc chiếm 1 danh mục.
+   - Bố cục 4 tầng tinh gọn: Header 1 dòng (thời điểm quét + link lọc nhanh `X repo xuất sắc (★★★)` + số repo mới tuần này), khu vực **Bộ công cụ tuyển chọn (`ToolkitShowcase`)** dạng 1 thanh chọn 6 nhóm có nút thu gọn/mở rộng, thanh lọc 5 tab gạch chân tối giản (`Đáng chú ý`, `Mới vào`, `Tiềm năng`, `Thay bản trả phí`, `Dùng ngay`) + nút gạt `★ Chỉ repo chất lượng (★★+)` (`quality=high|top`) + 2 `<select>` (`Thời gian`, `Danh mục`), và danh sách 1 cột `NewsfeedItem` siêu sạch tách biệt rõ huy hiệu sao chất lượng (vàng đặc) với số sao GitHub (xám rỗng).
 
 ## 3. Bộ danh mục gốc — Single Source of Truth (`src/config/taxonomy.ts`)
 Định nghĩa chính xác **7 nhóm lớn (`category`)** và **25 ngách chuyên sâu (`sub_category`)** kèm nhãn tiếng Việt và `hint` chi tiết. Export đầy đủ: `TAXONOMY`, `VALID_CATEGORIES`, `VALID_SUB_CATEGORIES`, `SUB_CATEGORY_MAP`, và `TAXONOMY_PROMPT_GUIDE`.

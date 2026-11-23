@@ -5,14 +5,21 @@ import { describe, expect, it, vi } from "vitest";
 import type { DatabaseClient } from "@/db";
 import { syncLogs, tools } from "@/db/schema";
 import type { AiClassification } from "@/lib/validator";
-import type { ClassifyRepoInput } from "../lib/classifier";
+import { classifyRepo, type ClassifyRepoInput } from "../lib/classifier";
 import type { CleanReadmeResult, GitHubRepoItem } from "../lib/github";
 import {
   AI_RATE_LIMIT_DELAY_MS,
+  buildReclassifyUpdateSet,
+  DEFAULT_SYNC_BATCH_SIZE,
   DEFAULT_SYNC_LIMIT,
+  EXISTING_QUERY_CHUNK_SIZE,
   formatClassificationTable,
   isDirectExecution,
+  parseSyncBatchSize,
+  parseSyncDelayMs,
   parseSyncLimit,
+  parseSyncReclassifyMode,
+  RECLASSIFY_FETCH_CONCURRENCY,
   runSync,
   sanitizeErrorMessage,
   type SyncLogger,
@@ -49,15 +56,47 @@ interface CapturedInsertSyncLogCall {
   };
 }
 
-function createMockDb(existingTools: readonly ExistingToolRow[] = []) {
+interface ReclassifyMockRow {
+  id: number;
+  githubId: number;
+  name: string;
+  fullName: string;
+  language: string | null;
+  summaryVi: string;
+}
+
+function createMockDb(
+  existingTools: readonly ExistingToolRow[] = [],
+  reclassifyRows: readonly ReclassifyMockRow[] = [],
+) {
   const updateCalls: CapturedUpdateCall[] = [];
   const insertToolCalls: CapturedInsertToolCall[] = [];
   const insertSyncLogCalls: CapturedInsertSyncLogCall[] = [];
+  let selectCalls = 0;
+
+  const makeThenableQuery = (rows: unknown[]) => ({
+    orderBy: vi.fn(() => ({
+      limit: vi.fn(async (n: number) => rows.slice(0, n)),
+    })),
+    then: (
+      resolve: (val: unknown[]) => void,
+      reject?: (err: unknown) => void,
+    ) => Promise.resolve(rows).then(resolve, reject),
+  });
 
   const mockClient = {
     select: vi.fn(() => ({
       from: vi.fn(() => ({
-        where: vi.fn(async () => [...existingTools]),
+        where: vi.fn(() => {
+          selectCalls += 1;
+          if (reclassifyRows.length > 0) {
+            return makeThenableQuery([...reclassifyRows]);
+          }
+          return makeThenableQuery(selectCalls === 1 ? [...existingTools] : []);
+        }),
+        orderBy: vi.fn(() => ({
+          limit: vi.fn(async (n: number) => [...reclassifyRows].slice(0, n)),
+        })),
       })),
     })),
     update: vi.fn((table: unknown) => ({
@@ -98,6 +137,7 @@ function createMockDb(existingTools: readonly ExistingToolRow[] = []) {
 
   return {
     db: mockClient as unknown as DatabaseClient,
+    getSelectCount: () => selectCalls,
     updateCalls,
     insertToolCalls,
     insertSyncLogCalls,
@@ -175,6 +215,77 @@ describe("scripts/sync-tools — conventions & helpers", () => {
     expect(() => parseSyncLimit("-3")).toThrow(/Invalid SYNC_LIMIT/);
     expect(() => parseSyncLimit("2.5")).toThrow(/Invalid SYNC_LIMIT/);
     expect(() => parseSyncLimit("abc")).toThrow(/Invalid SYNC_LIMIT/);
+  });
+
+  it("parses SYNC_DELAY_MS with default 4000 and validates non-negative integers", () => {
+    expect(AI_RATE_LIMIT_DELAY_MS).toBe(4000);
+    expect(EXISTING_QUERY_CHUNK_SIZE).toBe(500);
+    expect(parseSyncDelayMs(undefined)).toBe(4000);
+    expect(parseSyncDelayMs("")).toBe(4000);
+    expect(parseSyncDelayMs("   ")).toBe(4000);
+    expect(parseSyncDelayMs("0")).toBe(0);
+    expect(parseSyncDelayMs(" 5000 ")).toBe(5000);
+
+    expect(() => parseSyncDelayMs("-10")).toThrow(/Invalid SYNC_DELAY_MS/);
+    expect(() => parseSyncDelayMs("1.5")).toThrow(/Invalid SYNC_DELAY_MS/);
+    expect(() => parseSyncDelayMs("fast")).toThrow(/Invalid SYNC_DELAY_MS/);
+  });
+
+  it("parses SYNC_BATCH_SIZE and SYNC_RECLASSIFY with safe defaults and strict validation", () => {
+    expect(DEFAULT_SYNC_BATCH_SIZE).toBe(5);
+    expect(RECLASSIFY_FETCH_CONCURRENCY).toBe(5);
+    expect(parseSyncBatchSize(undefined)).toBe(5);
+    expect(parseSyncBatchSize("")).toBe(5);
+    expect(parseSyncBatchSize(" 10 ")).toBe(10);
+    expect(() => parseSyncBatchSize("0")).toThrow(/Invalid SYNC_BATCH_SIZE/);
+    expect(() => parseSyncBatchSize("21")).toThrow(/Invalid SYNC_BATCH_SIZE/);
+    expect(() => parseSyncBatchSize("abc")).toThrow(/Invalid SYNC_BATCH_SIZE/);
+
+    expect(parseSyncReclassifyMode(undefined)).toBe("none");
+    expect(parseSyncReclassifyMode("  ")).toBe("none");
+    expect(parseSyncReclassifyMode("UNCATEGORIZED")).toBe("uncategorized");
+    expect(parseSyncReclassifyMode(" all ")).toBe("all");
+    expect(() => parseSyncReclassifyMode("partial")).toThrow(
+      /Invalid SYNC_RECLASSIFY/,
+    );
+  });
+
+  it("buildReclassifyUpdateSet includes the AI fields + searchText and excludes isPinned/userNotes", () => {
+    const fixedNow = new Date("2026-11-23T10:00:00Z");
+    const updateSet = buildReclassifyUpdateSet(
+      "sha-reclass",
+      makeClassification(),
+      fixedNow,
+      {
+        name: "bruno",
+        fullName: "usebruno/bruno",
+        language: "TypeScript",
+        userNotes: "Ghi chú cá nhân không bị xóa",
+        topics: ["api-client"],
+      },
+    );
+
+    expect(Object.keys(updateSet).sort()).toEqual(
+      [
+        "category",
+        "readmeSha",
+        "replaces",
+        "searchText",
+        "secondarySubCategories",
+        "subCategory",
+        "summaryVi",
+        "updatedAt",
+        "usability",
+        "useCases",
+      ].sort(),
+    );
+    expect(updateSet.searchText).toContain("usebruno bruno");
+    expect(updateSet.searchText).toContain("ghi chu ca nhan khong bi xoa");
+    expect(updateSet).not.toHaveProperty("isPinned");
+    expect(updateSet).not.toHaveProperty("userNotes");
+    expect(updateSet).not.toHaveProperty("id");
+    expect(updateSet).not.toHaveProperty("githubId");
+    expect(updateSet).not.toHaveProperty("createdAt");
   });
 
   it("handles Windows drive-letter casing safely in isDirectExecution", () => {
@@ -277,7 +388,7 @@ describe("scripts/sync-tools — runSync pipeline", () => {
     });
   });
 
-  it("preserves isPinned and userNotes during UPSERT and sleeps 1500ms after AI classification", async () => {
+  it("preserves isPinned and userNotes during UPSERT and sleeps SYNC_DELAY_MS (default 4000ms) after AI classification", async () => {
     const newRepo = makeRepo({ id: 101, name: "new-cli", full_name: "acme/new-cli" });
     const changedRepo = makeRepo({
       id: 102,
@@ -350,6 +461,12 @@ describe("scripts/sync-tools — runSync pipeline", () => {
     });
 
     const combinedInfoLogs = infos.join("\n");
+    expect(combinedInfoLogs).toContain(
+      "[sync-tools] Đã tìm thấy 2 ứng viên, đang đối chiếu DB...",
+    );
+    expect(combinedInfoLogs).toContain(
+      "[sync-tools] Đang tải README & phân loại lô 1 (5 repo)...",
+    );
     expect(combinedInfoLogs).toContain("Tên repo");
     expect(combinedInfoLogs).toContain("Provider đã dùng");
     expect(combinedInfoLogs).toContain("subCategory");
@@ -423,24 +540,26 @@ describe("scripts/sync-tools — runSync pipeline", () => {
     });
   });
 
-  it("counts SYNC_LIMIT strictly on AI calls and updates only stars/lastPushedAt for changed existing repos past limit", async () => {
+  it("counts SYNC_LIMIT strictly on AI calls, updates stars for prior changed repos past limit, and breaks early on new repo past limit", async () => {
     const repo1Unchanged = makeRepo({ id: 1, full_name: "acme/unchanged-1", stargazers_count: 5100 });
     const repo2New = makeRepo({ id: 2, full_name: "acme/new-2" });
     const repo3Unchanged = makeRepo({ id: 3, full_name: "acme/unchanged-3", stargazers_count: 6200 });
     const repo4ChangedWithinLimit = makeRepo({ id: 4, full_name: "acme/changed-4" });
-    const repo5NewPastLimit = makeRepo({ id: 5, full_name: "acme/new-past-limit-5" });
     const repo6ChangedPastLimit = makeRepo({
       id: 6,
       full_name: "acme/changed-past-limit-6",
       stargazers_count: 9999,
       pushed_at: "2026-11-22T10:00:00Z",
     });
+    const repo5NewPastLimit = makeRepo({ id: 5, full_name: "acme/new-past-limit-5" });
+    const repo7AfterBreak = makeRepo({ id: 7, full_name: "acme/after-break-7" });
 
     const mockDb = createMockDb([
       { githubId: 1, readmeSha: "sha-1" },
       { githubId: 3, readmeSha: "sha-3" },
       { githubId: 4, readmeSha: "sha-4-old" },
       { githubId: 6, readmeSha: "sha-6-old" },
+      { githubId: 7, readmeSha: "sha-7" },
     ]);
 
     const fetchReadmeMock = vi.fn(async (fullName: string): Promise<CleanReadmeResult> => {
@@ -453,8 +572,6 @@ describe("scripts/sync-tools — runSync pipeline", () => {
           return { sha: "sha-3", text: "r3" };
         case "acme/changed-4":
           return { sha: "sha-4-new", text: "r4" };
-        case "acme/changed-past-limit-6":
-          return { sha: "sha-6-new", text: "r6" };
         default:
           throw new Error(`Unexpected README fetch for ${fullName}`);
       }
@@ -469,7 +586,7 @@ describe("scripts/sync-tools — runSync pipeline", () => {
     });
     const sleepMock = vi.fn(async () => undefined);
     const fixedNow = new Date("2026-11-22T18:00:00Z");
-    const { logger } = createTestLogger();
+    const { logger, infos } = createTestLogger();
 
     const summary = await runSync({
       db: mockDb.db,
@@ -478,28 +595,34 @@ describe("scripts/sync-tools — runSync pipeline", () => {
         repo2New,
         repo3Unchanged,
         repo4ChangedWithinLimit,
-        repo5NewPastLimit,
         repo6ChangedPastLimit,
+        repo5NewPastLimit,
+        repo7AfterBreak,
       ],
       fetchCleanReadme: fetchReadmeMock,
       classifyRepo: classifyMock,
       sleep: sleepMock,
       now: () => fixedNow,
-      env: { SYNC_LIMIT: "2" },
+      env: { SYNC_LIMIT: "2", SYNC_DELAY_MS: "4500" },
       logger,
     });
 
-    // Chỉ gọi AI đúng 2 lần (repo2 và repo4), bỏ qua repo5 (mới, sau limit) và không gọi AI cho repo6
+    // Chỉ gọi AI đúng 2 lần (repo2 và repo4), sleep đúng SYNC_DELAY_MS từ env
     expect(classifyMock).toHaveBeenCalledTimes(2);
     expect(classifyMock.mock.calls.map((c) => c[0].fullName)).toEqual([
       "acme/new-2",
       "acme/changed-4",
     ]);
+    expect(sleepMock).toHaveBeenNthCalledWith(1, 4500);
+    expect(sleepMock).toHaveBeenNthCalledWith(2, 4500);
 
-    // Repo mới sau SYNC_LIMIT không tốn request README
+    // Repo sau SYNC_LIMIT đều không tốn request README, và vòng lặp dừng sớm ở repo5 nên không đụng repo7
+    expect(fetchReadmeMock).not.toHaveBeenCalledWith("acme/changed-past-limit-6");
     expect(fetchReadmeMock).not.toHaveBeenCalledWith("acme/new-past-limit-5");
+    expect(fetchReadmeMock).not.toHaveBeenCalledWith("acme/after-break-7");
+    expect(infos.join("\n")).toContain("stopping loop early");
 
-    // 3 repo chỉ cập nhật stars (repo1, repo3, và repo6 đổi SHA nhưng đã chạm SYNC_LIMIT)
+    // 3 repo chỉ cập nhật stars (repo1, repo3, và repo6 đổi SHA trước điểm break; repo7 không bị đụng)
     expect(mockDb.updateCalls).toHaveLength(3);
     const repo6Update = mockDb.updateCalls[2];
     expect(repo6Update?.setPayload).toEqual({
@@ -511,12 +634,44 @@ describe("scripts/sync-tools — runSync pipeline", () => {
     expect(repo6Update?.setPayload).not.toHaveProperty("readmeSha");
 
     expect(summary).toMatchObject({
-      fetchedCount: 6,
+      fetchedCount: 7,
       aiProcessedCount: 2,
       updatedStarsOnly: 3,
       failedCount: 0,
       errorSummary: null,
     });
+  });
+
+  it("queries existing tools in chunks of 500 when candidates exceed 500 repos", async () => {
+    const candidates = Array.from({ length: 1200 }, (_, idx) =>
+      makeRepo({
+        id: 8000 + idx,
+        name: `repo-${idx + 1}`,
+        full_name: `acme/repo-${idx + 1}`,
+      }),
+    );
+
+    const mockDb = createMockDb([{ githubId: 8000, readmeSha: "sha-8000" }]);
+    const { logger } = createTestLogger();
+
+    const summary = await runSync({
+      db: mockDb.db,
+      fetchCandidateRepos: async () => candidates,
+      fetchCleanReadme: async () => ({ sha: "sha-8000", text: "README" }),
+      classifyRepo: vi.fn(async () => ({
+        classification: makeClassification(),
+        provider: "Groq-120B",
+      })),
+      sleep: vi.fn(async () => undefined),
+      env: { SYNC_LIMIT: "1", SYNC_DELAY_MS: "0" },
+      logger,
+    });
+
+    // 1200 candidate IDs -> 3 chunks (500 + 500 + 200)
+    expect(mockDb.getSelectCount()).toBe(3);
+    expect(summary.fetchedCount).toBe(1200);
+    expect(summary.updatedStarsOnly).toBe(1);
+    expect(summary.aiProcessedCount).toBe(1);
   });
 
   it("formats empty and non-empty classification summary tables cleanly", () => {
@@ -536,5 +691,298 @@ describe("scripts/sync-tools — runSync pipeline", () => {
     expect(table).toContain(
       "usebruno/bruno | Groq-70B         | api-client-testing | app-ready",
     );
+  });
+
+  it("handles large SYNC_LIMIT (35) smoothly across 429 TPM rate limits via all 5 fallback tiers including OpenRouter-Free-Backup", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const totalCandidates = 40;
+    const repos = Array.from({ length: totalCandidates }, (_, idx) =>
+      makeRepo({
+        id: 5000 + idx,
+        name: `repo-${idx + 1}`,
+        full_name: `acme/repo-${idx + 1}`,
+      }),
+    );
+
+    const mockDb = createMockDb([]);
+    const fetchReadmeMock = vi.fn(
+      async (fullName: string): Promise<CleanReadmeResult> => ({
+        sha: `sha-${fullName}`,
+        text: `README for ${fullName}`,
+      }),
+    );
+
+    let fakeNowMs = 10_000_000;
+    const sleepMock = vi.fn(async (ms: number) => {
+      fakeNowMs += ms;
+    });
+
+    const providerCounts: Record<string, number> = {
+      "openai/gpt-oss-120b": 0,
+      "qwen/qwen3.8-27b": 0,
+      "openai/gpt-oss-20b": 0,
+      "google/gemma-4-31b-it:free": 0,
+      "google/gemma-4-26b-a4b-it:free": 0,
+    };
+
+    const aiFetchMock = vi.fn<typeof fetch>(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as { model: string };
+      providerCounts[body.model] = (providerCounts[body.model] ?? 0) + 1;
+
+      if (
+        body.model === "openai/gpt-oss-120b" &&
+        providerCounts[body.model] > 3
+      ) {
+        return new Response(
+          '{"error":{"message":"TPM limit 8000 reached. Please try again in 80s."}}',
+          { status: 429 },
+        );
+      }
+      if (
+        body.model === "qwen/qwen3.8-27b" &&
+        providerCounts[body.model] > 12
+      ) {
+        return new Response("TPM limit reached", {
+          status: 429,
+          headers: { "retry-after": "80" },
+        });
+      }
+      if (
+        body.model === "openai/gpt-oss-20b" &&
+        providerCounts[body.model] > 10
+      ) {
+        return new Response("TPM limit reached", {
+          status: 429,
+          headers: { "retry-after": "80" },
+        });
+      }
+      if (
+        body.model === "google/gemma-4-31b-it:free" &&
+        providerCounts[body.model] > 5
+      ) {
+        return new Response("OpenRouter 31B limit reached", {
+          status: 429,
+          headers: { "retry-after": "80" },
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify(makeClassification()),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+
+    const { logger } = createTestLogger();
+
+    const summary = await runSync({
+      db: mockDb.db,
+      fetchCandidateRepos: async () => repos,
+      fetchCleanReadme: fetchReadmeMock,
+      classifyRepo: (input, opts) =>
+        classifyRepo(input, {
+          ...opts,
+          env: {
+            GROQ_API_KEY: "gsk_mock_key",
+            OPENROUTER_API_KEY: "sk-or-mock_key",
+          },
+          fetchImpl: aiFetchMock,
+        }),
+      sleep: sleepMock,
+      delayMs: 500,
+      now: () => new Date(fakeNowMs),
+      env: { SYNC_LIMIT: "35" },
+      logger,
+    });
+
+    expect(summary.fetchedCount).toBe(40);
+    expect(summary.aiProcessedCount).toBe(35);
+    expect(summary.failedCount).toBe(0);
+    expect(summary.errorSummary).toBeNull();
+    expect(mockDb.insertToolCalls).toHaveLength(35);
+    expect(fetchReadmeMock).toHaveBeenCalledTimes(35);
+
+    const usedProviders = new Set(summary.classified.map((c) => c.provider));
+    expect(usedProviders).toEqual(
+      new Set([
+        "Groq-120B",
+        "Groq-Qwen-27B",
+        "Groq-20B-Fast",
+        "OpenRouter-Free",
+        "OpenRouter-Free-Backup",
+      ]),
+    );
+
+    // Cooldown prevented hammering saturated providers after their single 429 response
+    expect(providerCounts["openai/gpt-oss-120b"]).toBe(4);
+    expect(providerCounts["qwen/qwen3.8-27b"]).toBe(13);
+    expect(providerCounts["openai/gpt-oss-20b"]).toBe(11);
+    expect(providerCounts["google/gemma-4-31b-it:free"]).toBe(6);
+    expect(providerCounts["google/gemma-4-26b-a4b-it:free"]).toBe(5);
+  });
+
+  it("reclassifies uncategorized and all tools in batches via classifyRepoBatch without touching isPinned or userNotes", async () => {
+    const dbRows: ReclassifyMockRow[] = [
+      {
+        id: 11,
+        githubId: 9011,
+        name: "open-webui",
+        fullName: "open-webui/open-webui",
+        language: "Python",
+        summaryVi: "Tóm tắt cũ",
+      },
+      {
+        id: 12,
+        githubId: 9012,
+        name: "missing-meta-tool",
+        fullName: "acme/missing-meta-tool",
+        language: "Go",
+        summaryVi: "Mô tả dự phòng từ DB khi GitHub trả 404 metadata",
+      },
+      {
+        id: 13,
+        githubId: 9013,
+        name: "broken-readme-tool",
+        fullName: "acme/broken-readme-tool",
+        language: "Rust",
+        summaryVi: "Tóm tắt khác",
+      },
+    ];
+
+    const mockDb = createMockDb([], dbRows);
+    const fetchCandidateMock = vi.fn();
+    const fetchMetaMock = vi.fn(async (fullName: string) => {
+      if (fullName === "open-webui/open-webui") {
+        return makeRepo({
+          id: 9011,
+          name: "open-webui",
+          full_name: "open-webui/open-webui",
+          homepage: "https://openwebui.com",
+          description: "Extensible self-hosted AI interface",
+          language: "Python",
+          topics: ["llm", "webui"],
+        });
+      }
+      return null;
+    });
+    const fetchReadmeMock = vi.fn(async (fullName: string): Promise<CleanReadmeResult> => {
+      if (fullName === "acme/broken-readme-tool") {
+        throw new Error("README network timeout");
+      }
+      return { sha: `sha-${fullName}`, text: `README for ${fullName}` };
+    });
+
+    const batchMock = vi.fn(async (inputs: readonly ClassifyRepoInput[]) =>
+      inputs.map((input) => ({
+        fullName: input.fullName,
+        ok: true as const,
+        result: {
+          provider: "Gemini-3.5-Flash-Lite",
+          classification: makeClassification({
+            category: "ai-llm",
+            sub_category:
+              input.fullName === "open-webui/open-webui"
+                ? "ai-chat-ui"
+                : "cli-dev-env",
+            usability:
+              input.fullName === "open-webui/open-webui"
+                ? "app-ready"
+                : "cli-tool",
+          }),
+        },
+      })),
+    );
+    const sleepMock = vi.fn(async () => undefined);
+    const fixedNow = new Date("2026-11-23T12:00:00Z");
+    const { logger, infos } = createTestLogger();
+
+    const summary = await runSync({
+      db: mockDb.db,
+      fetchCandidateRepos: fetchCandidateMock,
+      fetchRepoMetadata: fetchMetaMock,
+      fetchCleanReadme: fetchReadmeMock,
+      classifyRepoBatch: batchMock,
+      sleep: sleepMock,
+      now: () => fixedNow,
+      env: {
+        SYNC_RECLASSIFY: "uncategorized",
+        SYNC_LIMIT: "10",
+        SYNC_BATCH_SIZE: "2",
+        SYNC_DELAY_MS: "100",
+      },
+      logger,
+    });
+
+    // Does not crawl search API in reclassify mode
+    expect(fetchCandidateMock).not.toHaveBeenCalled();
+    expect(fetchMetaMock).toHaveBeenCalledTimes(3);
+    expect(fetchReadmeMock).toHaveBeenCalledTimes(3);
+    expect(batchMock).toHaveBeenCalledTimes(1);
+    expect(batchMock.mock.calls[0]?.[0]).toEqual([
+      {
+        name: "open-webui",
+        fullName: "open-webui/open-webui",
+        description: "Extensible self-hosted AI interface",
+        homepage: "https://openwebui.com",
+        language: "Python",
+        topics: ["llm", "webui"],
+        readmeText: "README for open-webui/open-webui",
+      },
+      {
+        name: "missing-meta-tool",
+        fullName: "acme/missing-meta-tool",
+        description: "Mô tả dự phòng từ DB khi GitHub trả 404 metadata",
+        homepage: null,
+        language: "Go",
+        topics: [],
+        readmeText: "README for acme/missing-meta-tool",
+      },
+    ]);
+
+    expect(mockDb.updateCalls).toHaveLength(2);
+    for (const update of mockDb.updateCalls) {
+      expect(update.table).toBe(tools);
+      expect(update.setPayload).not.toHaveProperty("isPinned");
+      expect(update.setPayload).not.toHaveProperty("userNotes");
+      expect(update.setPayload).toHaveProperty("updatedAt", fixedNow);
+    }
+
+    expect(summary).toMatchObject({
+      fetchedCount: 3,
+      aiProcessedCount: 2,
+      updatedStarsOnly: 0,
+      failedCount: 1,
+    });
+    expect(summary.errorSummary).toContain("acme/broken-readme-tool");
+    expect(infos.join("\n")).toContain("Chế độ phân loại lại (uncategorized)");
+    expect(sleepMock).toHaveBeenCalledWith(100);
+
+    // Also verify SYNC_RECLASSIFY=all path executes cleanly
+    const mockDbAll = createMockDb([], [dbRows[0]]);
+    const summaryAll = await runSync({
+      db: mockDbAll.db,
+      fetchCandidateRepos: fetchCandidateMock,
+      fetchRepoMetadata: fetchMetaMock,
+      fetchCleanReadme: fetchReadmeMock,
+      classifyRepoBatch: batchMock,
+      sleep: sleepMock,
+      now: () => fixedNow,
+      env: {
+        SYNC_RECLASSIFY: "all",
+        SYNC_LIMIT: "1",
+        SYNC_BATCH_SIZE: "5",
+        SYNC_DELAY_MS: "0",
+      },
+      logger,
+    });
+    expect(summaryAll.aiProcessedCount).toBe(1);
   });
 });
