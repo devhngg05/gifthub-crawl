@@ -2,6 +2,23 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.29] - 2026-11-23 (Đồng bộ liên tục nhiều đợt, Distributed Lock, Auto-Pruning DB & Vercel Cron)
+### Đã xây dựng & Nâng cấp
+- **Distributed Lease Lock chống chạy đè (`scripts/lib/sync/lock.ts`, `src/lib/queries/`):**
+  - Thiết kế cơ chế khóa phân tán nguyên tử trên bảng `sync_logs` (`SYNC_LOCK_ROW_ID = -1`, TTL `SYNC_LOCK_TTL_SECONDS = 1500` mặc định, validate qua Zod `30..7200`s) phù hợp hoàn toàn với HTTP driver phi trạng thái `@neondatabase/serverless` (`neon()`).
+  - Nếu đã có phiên sync khác đang giữ lease còn hạn, worker thoát êm với mã `0` (`skippedDueToLock: true`) không làm fail CI; tự động thu hồi lease quá hạn (stale takeover) và luôn nhả khóa ở khối `finally`.
+  - Cập nhật `fetchLogsPageData()` (`src/lib/queries/logs-query.ts`) và `fetchNewsfeedPageData()` (`src/lib/queries/tools-page-query.ts`) lọc `id > 0` để dòng lock `id = -1` không hiển thị lên UI.
+- **Giám sát dung lượng DB & Tự động cắt tỉa repo sao thấp (`scripts/lib/sync/prune.ts`):**
+  - Đọc và validate bằng Zod 5 biến cấu hình cho Neon Free Tier 512MB (`DB_MAX_TOOLS=4000`, `DB_PRUNE_THRESHOLD_MB=380`, `DB_PRUNE_BATCH_SIZE=100` giới hạn `1..500`, `DB_MIN_TOOLS_KEEP=500`, `SYNC_LOGS_MAX_ROWS=300`).
+  - Thực thi đúng 1 lượt xóa có giới hạn mỗi phiên (không vòng lặp `while`), **tuyệt đối bảo vệ** bản ghi `is_pinned = true` hoặc có `user_notes` không rỗng, ưu tiên xóa theo `stars ASC, last_pushed_at ASC, updated_at ASC, id ASC`, chạy best-effort `VACUUM (ANALYZE) tools`, dọn `sync_logs` cũ (giữ nguyên `id = -1`), và suy ra ngưỡng sao sàn `minEligibleStars` để bỏ qua repo mới sao thấp khi DB đang đầy.
+- **Tách lõi `runSync` & Vercel Cron Micro-Batch (`scripts/lib/sync/runner.ts`, `cron-config.ts`, `src/lib/auth.ts`, `src/app/api/cron/sync/route.ts`, `vercel.json`):**
+  - Tách logic `runSync()` ra `scripts/lib/sync/runner.ts` (không phụ thuộc `dotenv`) và giữ `scripts/sync-tools.ts` làm CLI entrypoint tương thích ngược (`import "./load-env";` ở dòng 1).
+  - Bổ sung `verifyCronSecret()` / `verifyCronRequest()` (`Authorization: Bearer <CRON_SECRET>`, SHA-256 + `crypto.timingSafeEqual`, fail-closed `503`), route `GET | POST /api/cron/sync` (`dynamic = "force-dynamic"`, `maxDuration = 60`, micro-batch `SYNC_LIMIT <= 5`, 2 luồng nhẹ, `delayMs = 0`, `maxCooldownWaitMs = 5_000`), và `vercel.json` (`0 3 * * *` tương thích Vercel Hobby).
+- **Workflow GitHub Actions liên tục & Vệ sinh repo (`.github/workflows/daily-sync.yml`, `.env.example`):**
+  - Nâng cấp lịch sang mỗi 2 tiếng (`0 */2 * * *`), bổ sung trigger `deployment_status` (chạy ngay sau khi Vercel deploy thành công), `workflow_dispatch` (`sync_limit`, `prune_only`), `concurrency` (`cancel-in-progress: false`), `SYNC_LIMIT=12`, `SYNC_BATCH_SIZE=5` cùng các biến `DB_*`.
+  - Xóa tệp thừa `gifthub-crawl.zip` & `tsconfig.tsbuildinfo`, cập nhật `.env.example`, `docs/ARCHITECTURE.md`, `docs/API-CONTRACTS.md`, `docs/DATA-SCHEMA.md`, `README.md`.
+- **Kiểm thử:** Thêm mới `scripts/lib/__tests__/lock.test.ts`, `scripts/lib/__tests__/prune.test.ts`, `src/app/api/cron/sync/__tests__/route.test.ts` và mở rộng `scripts/__tests__/sync-tools.test.ts`.
+
 ## [0.1.28] - 2026-11-23 (Tách module Rate Limiter & Gia cố giới hạn bộ nhớ cho `/api/admin/session`)
 ### Đã tái cấu trúc & Gia cố
 - **Tách module Rate Limiter (`src/lib/admin-rate-limit.ts`):**

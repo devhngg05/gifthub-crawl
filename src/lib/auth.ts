@@ -15,6 +15,12 @@ export interface AdminAuthResult {
   error?: string;
 }
 
+export interface CronAuthResult {
+  authorized: boolean;
+  status: 200 | 401 | 503;
+  error?: string;
+}
+
 export interface AdminSessionStatus {
   authenticated: boolean;
   authRequired: boolean;
@@ -383,4 +389,52 @@ export function getAdminSessionStatus(
     authenticated: verifyAdminSessionToken(sessionToken),
     authRequired: true,
   };
+}
+
+/** Đọc giá trị `CRON_SECRET` đã chuẩn hóa khoảng trắng từ môi trường. */
+export function getConfiguredCronSecret(): string {
+  return process.env.CRON_SECRET?.trim() ?? "";
+}
+
+/**
+ * Xác thực header `Authorization: Bearer <CRON_SECRET>` bằng SHA-256 + `crypto.timingSafeEqual`.
+ * Fail-closed `503` khi thiếu `CRON_SECRET`; trả về `401` khi thiếu/sai định dạng/sai token.
+ */
+export function verifyCronSecret(
+  authorizationHeader: string | null,
+): CronAuthResult {
+  const configuredSecret = getConfiguredCronSecret();
+  if (configuredSecret.length === 0) {
+    return {
+      authorized: false,
+      status: 503,
+      error: "CRON_SECRET is not configured",
+    };
+  }
+
+  const match = authorizationHeader?.match(/^Bearer\s+(.+)$/i);
+  const providedToken = match?.[1]?.trim() ?? "";
+  if (providedToken.length === 0) {
+    return { authorized: false, status: 401, error: "Unauthorized" };
+  }
+
+  const expectedDigest = createHash("sha256")
+    .update(configuredSecret, "utf8")
+    .digest();
+  const providedDigest = createHash("sha256")
+    .update(providedToken, "utf8")
+    .digest();
+
+  if (timingSafeEqual(expectedDigest, providedDigest)) {
+    return { authorized: true, status: 200 };
+  }
+
+  return { authorized: false, status: 401, error: "Unauthorized" };
+}
+
+/** Xác thực request gọi tới route Cron (`/api/cron/sync`). */
+export function verifyCronRequest(
+  request: Request | NextRequest,
+): CronAuthResult {
+  return verifyCronSecret(request.headers.get("authorization"));
 }

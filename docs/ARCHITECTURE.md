@@ -4,13 +4,14 @@
 
 ```mermaid
 flowchart LR
-    GH["GitHub API (Trụ cột + Mới nổi & Quality Gate)"] -->|"Clean README <= 2500 chars + SHA"| WK["scripts/sync-tools.ts"]
-    WK -->|"Kiểm tra readmeSha"| DB[("Neon PostgreSQL (tools, sync_logs)")]
-    WK -->|"SHA mới/đổi (<= SYNC_LIMIT)"| AI["Fallback: Groq-70B -> Groq-8B -> GH Models -> OpenRouter"]
+    GH["GitHub API (Trụ cột + Mới nổi & Quality Gate)"] -->|"Clean README <= 2500 chars + SHA"| WK["scripts/sync-tools.ts / /api/cron/sync"]
+    WK -->|"Lease Lock (sync_logs id=-1) + Check dung lượng"| DB[("Neon PostgreSQL (tools, sync_logs)")]
+    WK -->|"SHA mới/đổi (<= SYNC_LIMIT)"| AI["Fallback: Groq / Gemini / OpenRouter"]
     AI -->|"AiClassificationSchema hợp lệ"| DB
-    AI -->|"Cả 4 fail: bỏ qua upsert, ghi sync_logs"| DB
+    AI -->|"Fail: bỏ qua upsert, ghi sync_logs"| DB
+    WK -->|"Post-sync Prune (<= DB_PRUNE_BATCH_SIZE)"| DB
     DB -->|"Drizzle ORM (force-dynamic)"| UI["Next.js App Router (/, /newsfeed, /logs)"]
-    UI -->|"PATCH + x-admin-secret (sessionStorage)"| API["/api/tools/[id]"]
+    UI -->|"PATCH + HttpOnly Cookie / x-admin-secret"| API["/api/tools/[id]"]
     API -->|"Chỉ sửa isPinned, userNotes, subCategory"| DB
 ```
 
@@ -38,8 +39,10 @@ flowchart LR
 │   ├── PROJECT-RULES.md
 │   └── CHANGELOG.md
 ├── .github/workflows/
+│   ├── ci.yml
 │   └── daily-sync.yml
 ├── drizzle.config.ts
+├── vercel.json                    # Cấu hình Vercel Cron (/api/cron/sync)
 ├── scripts/
 │   ├── load-env.ts
 │   ├── sync-tools.ts              # CLI entrypoint + re-export tương thích
@@ -57,6 +60,10 @@ flowchart LR
 │       │   ├── prompts.ts         # System/User prompt & parser JSON
 │       │   └── index.ts           # Điều phối fallback lẻ & batch
 │       └── sync/
+│           ├── lock.ts            # Distributed Lease Lock (sync_logs id=-1)
+│           ├── prune.ts           # Giám sát dung lượng DB & cắt tỉa sao thấp an toàn
+│           ├── runner.ts          # Lõi điều phối runSync (dùng chung CLI & Vercel Cron)
+│           ├── cron-config.ts     # Cấu hình micro-batch an toàn cho Vercel Cron
 │           ├── upsert.ts          # Đối chiếu DB, upsert & sync_logs
 │           └── reclassify.ts      # Luồng phân loại lại SYNC_RECLASSIFY
 └── src/
@@ -120,6 +127,12 @@ flowchart LR
         │   ├── page.tsx
         │   └── loading.tsx
         └── api/
+            ├── cron/
+            │   └── sync/
+            │       └── route.ts
+            ├── admin/
+            │   └── session/
+            │       └── route.ts
             └── tools/
                 ├── suggest/
                 │   └── route.ts
@@ -130,6 +143,7 @@ flowchart LR
 ## 3. Thành phần kỹ thuật cốt lõi
 - **Database Driver (`src/db/index.ts`, `drizzle.config.ts`):** `sanitizeDatabaseUrl()` xóa `channel_binding` khỏi URL (giữ `sslmode=require`); app dùng HTTP driver `neon()` với `DATABASE_URL`; Drizzle migration ưu tiên `DATABASE_URL_UNPOOLED` (fallback `DATABASE_URL`).
 - **Tầng truy vấn & nghiệp vụ tách lớp (`src/lib/`):** Các module lớn được chia nhỏ đơn trách nhiệm vào `src/lib/search/`, `src/lib/newsfeed/`, và truy vấn DB thuần đặt tại `src/lib/queries/` (`tools-page-query.ts`, `logs-query.ts`), duy trì barrel re-export (`src/lib/search-engine.ts`, `src/lib/newsfeed.ts`) để tương thích ngược hoàn toàn.
-- **Worker (`scripts/load-env.ts`, `scripts/sync-tools.ts`, `scripts/lib/`):** `import "./load-env";` (`dotenv.config({ path: ".env.local" })`) luôn đặt ở dòng đầu tiên trước `@/db`; phân tách rõ `scripts/lib/github/`, `scripts/lib/classifier/` và `scripts/lib/sync/` (giữ barrel `github.ts`, `classifier.ts` và re-export trên `sync-tools.ts`); bọc `try/catch` từng repo và ghi 1 dòng tổng kết vào `sync_logs`.
+- **Worker, Distributed Lock & Auto-Pruning (`scripts/load-env.ts`, `scripts/sync-tools.ts`, `scripts/lib/sync/`):** `import "./load-env";` luôn đặt ở dòng đầu tiên của `scripts/sync-tools.ts`; lõi `runSync()` nằm ở `scripts/lib/sync/runner.ts` (không phụ thuộc `dotenv`) để dùng chung giữa CLI worker và Vercel Serverless (`/api/cron/sync`). Khóa chống chạy đè (`lock.ts`) dùng bản ghi lease nguyên tử `sync_logs` (`id = -1`, TTL `SYNC_LOCK_TTL_SECONDS`, ẩn khỏi UI với `id > 0`) phù hợp với Neon HTTP driver phi trạng thái. Cuối mỗi lượt sync, `prune.ts` kiểm tra dung lượng DB (`pg_database_size`), xóa tối đa 1 lô `DB_PRUNE_BATCH_SIZE` repo sao thấp chưa ghim/chưa có ghi chú, giữ sàn `DB_MIN_TOOLS_KEEP`, best-effort `VACUUM (ANALYZE) tools`, dọn `sync_logs` vượt `SYNC_LOGS_MAX_ROWS`, và truyền ngưỡng sao sàn (`minEligibleStars`) để lượt sync không cào lại repo sao thấp khi DB gần đầy.
+- **Vercel Cron (`/api/cron/sync`, `vercel.json`):** Route handler bảo vệ bằng `CRON_SECRET` (`Authorization: Bearer`, `crypto.timingSafeEqual`, fail-closed `503`), chạy micro-batch `SYNC_LIMIT <= 5` trong trần `maxDuration = 60`.
 - **UI & Custom Hooks (`src/app/`, `src/components/`, `src/hooks/`):** Dark Mode (`bg-zinc-950`, card `bg-zinc-900/60`, `border-zinc-800`, `emerald-400/500`), `export const dynamic = "force-dynamic"`, tách logic client sang custom hooks (`useSearchSuggest.ts`, `useToolMutations.ts`) và subcomponents (`SearchSuggestDropdown.tsx`, `ToolCardHeader.tsx`, `SidebarCategoryTree.tsx`); các `page.tsx` (`/`, `/newsfeed`, `/logs`) chỉ đọc `searchParams`, gọi hàm query và ráp layout.
-- **GitHub Actions (`.github/workflows/daily-sync.yml`):** `cron: "0 19 * * *"` (02:00 sáng VN) + `workflow_dispatch` (input `limit` mặc định `"25"`), nạp secrets `DATABASE_URL`, `GITHUB_TOKEN: ${{ secrets.GH_PAT }}`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`.
+- **GitHub Actions (`.github/workflows/daily-sync.yml`):** Chạy liên tục mỗi 2 giờ (`cron: "0 */2 * * *"`), tự động kích hoạt ngay sau khi Vercel báo `deployment_status` thành công (`state == 'success'`), và hỗ trợ `workflow_dispatch` (`sync_limit`, `prune_only`) với `concurrency` (`group: github-tool-radar-sync`, `cancel-in-progress: false`), mặc định `SYNC_LIMIT: "12"`, `SYNC_BATCH_SIZE: "5"`.

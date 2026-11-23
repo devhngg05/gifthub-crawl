@@ -108,3 +108,21 @@ COMMIT;
 ```
 
 Sau khi chạy xong khối SQL nâng cấp trên, nếu muốn chuyển sang quản lý hoàn toàn bằng `npm run db:migrate` cho các migration kế tiếp (`0001+`), ghi nhận hash SHA-256 của `drizzle/0000_init_schema.sql` và `when` từ `drizzle/meta/_journal.json` vào bảng `drizzle.__drizzle_migrations` (hoặc tạo bảng trước rồi chèn 1 dòng baseline khớp `hash` & `created_at` của `0000_init_schema`).
+
+## 6. Distributed Lease Lock, Giám sát dung lượng & Tự động cắt tỉa (`scripts/lib/sync/lock.ts`, `scripts/lib/sync/prune.ts`)
+
+### 6.1. Khóa chống chạy đè cho Neon HTTP Driver (`lock.ts`)
+- `src/db/index.ts` sử dụng `@neondatabase/serverless` HTTP driver (`neon()`) phi trạng thái giữa các truy vấn, nên PostgreSQL session advisory lock (`pg_try_advisory_lock(SYNC_LOCK_ADVISORY_KEY)`) tự giải phóng ngay sau khi kết thúc một HTTP request đơn lẻ.
+- Vì vậy, worker sử dụng **Distributed Lease Lock nguyên tử** ngay trên bảng `sync_logs` bằng dòng dự phòng `id = -1` (`SYNC_LOCK_ROW_ID = -1`, `error_summary = '__SYNC_LOCK__:<owner>:<expiresAt>'`) qua câu lệnh `INSERT ... ON CONFLICT (id) DO UPDATE ... WHERE sync_logs.ran_at < $staleBefore RETURNING ...`, giải phóng có kiểm tra chủ sở hữu (`DELETE ... WHERE id = -1 AND error_summary = $marker`).
+- TTL mặc định `SYNC_LOCK_TTL_SECONDS = 1500` giây (25 phút, hợp lệ `30..7200`s). Nếu một worker khác đang giữ lease còn hạn, tiến trình mới thoát êm với mã `0` (`skippedDueToLock: true`).
+- Mọi truy vấn hiển thị UI (`fetchLogsPageData`, `fetchNewsfeedPageData`) và tác vụ dọn log đều lọc `id > 0` để dòng lock `id = -1` không bao giờ lộ lên `/logs` hay bị xóa nhầm.
+
+### 6.2. Giám sát dung lượng DB & Cắt tỉa repo sao thấp an toàn (`prune.ts`)
+- Tham số cấu hình đọc từ env và validate bằng Zod (tối ưu cho Neon Free Tier 512MB):
+  - `DB_MAX_TOOLS` (mặc định `4000`): trần số lượng công cụ trong `tools`.
+  - `DB_PRUNE_THRESHOLD_MB` (mặc định `380`): ngưỡng kích thước DB theo `pg_database_size(current_database())::bigint`.
+  - `DB_PRUNE_BATCH_SIZE` (mặc định `100`, giới hạn `1..500`): số repo tối đa xóa trong **đúng 1 lượt** (tuyệt đối không chạy vòng lặp `while (dbSize > threshold)`).
+  - `DB_MIN_TOOLS_KEEP` (mặc định `500`): ngưỡng sàn bảo vệ — dừng xóa nếu tổng bảng tụt tới mức này.
+  - `SYNC_LOGS_MAX_ROWS` (mặc định `300`): giữ tối đa `N` dòng nhật ký mới nhất (`id > 0`).
+- **Bảo vệ tuyệt đối dữ liệu người dùng:** Chỉ chọn xóa các bản ghi có `is_pinned = false` **VÀ** `(user_notes IS NULL OR btrim(user_notes) = '')`, sắp xếp theo `stars ASC, last_pushed_at ASC, updated_at ASC, id ASC`. Sau khi xóa có bản ghi, chạy best-effort `VACUUM (ANALYZE) tools` (bọc `try/catch`).
+- **Chống cào lại repo sao thấp:** Đầu mỗi phiên sync thường, nếu DB đang vượt `DB_PRUNE_THRESHOLD_MB` hoặc `>= DB_MAX_TOOLS`, `getStarFloorThreshold()` tính ngưỡng `minEligibleStars` để `runner.ts` bỏ qua ngay các repo mới có `stargazers_count <= minEligibleStars` mà không gọi README hay AI.

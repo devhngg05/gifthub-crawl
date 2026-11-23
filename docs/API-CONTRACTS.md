@@ -79,3 +79,15 @@
   - Validate body `{ secret: string }` (Zod `.strict()`, trim `1..512` ký tự, sai → `400`), kiểm tra `ADMIN_SECRET` qua SHA-256 + `crypto.timingSafeEqual` (`401` nếu sai, `503` nếu thiếu `ADMIN_SECRET` và không bật bypass).
   - Nếu hợp lệ: cấp cookie `gtr_admin_session` (`HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` khi `NODE_ENV === 'production'`, `Max-Age=43200`) và trả về `200 OK` `{ authenticated: true, authRequired: true }` (hoặc `authRequired: false` khi bypass dev đang bật).
 - **`DELETE /api/admin/session`:** Kiểm tra CSRF (`403` nếu sai nguồn), xóa cookie `gtr_admin_session` (`Max-Age=0`) và trả về `200 OK` `{ authenticated: false }`.
+
+## 7. API Vercel Cron Micro-Batch Sync: `GET | POST /api/cron/sync` (`src/app/api/cron/sync/route.ts`)
+- **Cấu hình Runtime & Cache:** `export const dynamic = "force-dynamic"`, `export const maxDuration = 60`, mọi phản hồi kèm `Cache-Control: no-store`.
+- **Xác thực (`src/lib/auth.ts` — `verifyCronRequest`):**
+  - Bắt buộc header `Authorization: Bearer <CRON_SECRET>`, đối chiếu digest SHA-256 bằng `crypto.timingSafeEqual`.
+  - **Fail-closed tuyệt đối:** Thiếu `CRON_SECRET` trả `503 Service Unavailable`; thiếu/sai định dạng/sai token trả `401 Unauthorized`.
+- **Cấu hình Micro-Batch (`scripts/lib/sync/cron-config.ts`):**
+  - Ép trần `SYNC_LIMIT` trong khoảng `1..5` (`CRON_MAX_SYNC_LIMIT = 5`), `SYNC_BATCH_SIZE = 5`, `SYNC_DELAY_MS = 0`, `SYNC_RECLASSIFY = "none"`, `maxCooldownWaitMs = 5_000`, `aiTimeoutMs = 20_000`, `lockTtlSeconds = 120`, `lockOwner = "vercel-cron"`.
+  - Giới hạn lấy ứng viên nhẹ nhàng gồm 2 luồng (`rising` + 1 luồng xoay vòng theo giờ UTC), `pagesPerQuery = 1`, `perPage = 50`, `requestDelayMs = 300`, `timeoutMs = 10_000` để hoàn tất gọn dưới 60 giây trên Vercel Serverless.
+- **Mã phản hồi:**
+  - `200 OK`: `{ ok: true, skipped: false, summary }` hoặc `{ ok: true, skipped: true, reason: "lock_held", summary }` khi đã có worker khác giữ khóa phân tán.
+  - `401 Unauthorized`, `503 Service Unavailable`, `500 Internal Server Error` (`{ ok: false, error: "Sync execution failed" }`, log server đã sanitize).

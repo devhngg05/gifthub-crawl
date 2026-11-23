@@ -1,4 +1,4 @@
-import { and, desc, sql, type SQL } from "drizzle-orm";
+import { and, desc, gt, sql, type SQL } from "drizzle-orm";
 import { db } from "@/db";
 import { syncLogs, tools, type ToolRow } from "@/db/schema";
 import type { NewsfeedToolRow } from "@/lib/newsfeed";
@@ -225,6 +225,7 @@ export async function fetchNewsfeedPageData(): Promise<{
     db
       .select({ ranAt: syncLogs.ranAt })
       .from(syncLogs)
+      .where(gt(syncLogs.id, 0))
       .orderBy(desc(syncLogs.ranAt))
       .limit(1),
   ]);

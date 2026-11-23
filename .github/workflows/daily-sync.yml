@@ -1,14 +1,21 @@
-name: Daily GitHub Tool Radar Sync
+name: Continuous GitHub Tool Radar Sync
 
 on:
   schedule:
-    - cron: "0 1,7,13,19 * * *"
+    - cron: "0 */2 * * *"
+  deployment_status:
   workflow_dispatch:
     inputs:
-      limit:
+      sync_limit:
         description: "Maximum repositories to classify per run"
         required: false
-        default: "40"
+        default: "12"
+        type: string
+      prune_only:
+        description: "Only run DB capacity check and safe low-star pruning"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -19,8 +26,9 @@ concurrency:
 
 jobs:
   sync:
+    if: ${{ github.event_name != 'deployment_status' || github.event.deployment_status.state == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,5 +43,12 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          SYNC_LIMIT: ${{ github.event.inputs.limit || '40' }}
+          SYNC_LIMIT: ${{ inputs.sync_limit || '12' }}
+          SYNC_BATCH_SIZE: "5"
           SYNC_DELAY_MS: "4000"
+          SYNC_PRUNE_ONLY: ${{ inputs.prune_only == true && 'true' || 'false' }}
+          DB_MAX_TOOLS: "4000"
+          DB_PRUNE_THRESHOLD_MB: "380"
+          DB_PRUNE_BATCH_SIZE: "100"
+          DB_MIN_TOOLS_KEEP: "500"
+          SYNC_LOGS_MAX_ROWS: "300"

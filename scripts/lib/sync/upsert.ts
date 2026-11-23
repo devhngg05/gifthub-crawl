@@ -4,6 +4,7 @@ import { syncLogs, tools, type NewToolRow } from "@/db/schema";
 import { buildToolSearchText } from "@/lib/search-engine";
 import type { AiClassification } from "@/lib/validator";
 import type { GitHubRepoItem } from "../github";
+import type { PruneDatabaseSummary } from "./prune";
 
 export const EXISTING_QUERY_CHUNK_SIZE = 500;
 export const MAX_ERROR_SUMMARY_LENGTH = 4000;
@@ -31,6 +32,10 @@ export interface SyncRunSummary {
   failedCount: number;
   errorSummary: string | null;
   classified: ClassifiedRepoSummary[];
+  skippedDueToLock?: boolean;
+  skippedLowStarCount?: number;
+  minEligibleStars?: number | null;
+  pruneSummary?: PruneDatabaseSummary | null;
 }
 
 export interface SyncLogger {

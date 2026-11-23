@@ -24,10 +24,12 @@ import {
   parseSyncBatchSize,
   parseSyncDelayMs,
   parseSyncLimit,
+  parseSyncPruneOnly,
   parseSyncReclassifyMode,
   RECLASSIFY_FETCH_CONCURRENCY,
   runSync,
   sanitizeErrorMessage,
+  type PruneDatabaseSummary,
   type SyncLogger,
   type UpsertToolConflictSet,
   type UpsertToolValues,
@@ -1273,5 +1275,244 @@ describe("scripts/sync-tools — runSync pipeline", () => {
       warns.some((w) => w.includes("Circuit breaker kích hoạt (reclassify)")),
     ).toBe(true);
     expect(mockDb.insertSyncLogCalls).toHaveLength(1);
+  });
+});
+
+describe("scripts/sync-tools — lock, prune & low-star filtering integration", () => {
+  it("parses SYNC_PRUNE_ONLY safely", () => {
+    expect(parseSyncPruneOnly(undefined)).toBe(false);
+    expect(parseSyncPruneOnly("  ")).toBe(false);
+    expect(parseSyncPruneOnly("true")).toBe(true);
+    expect(parseSyncPruneOnly("1")).toBe(true);
+    expect(parseSyncPruneOnly("FALSE")).toBe(false);
+    expect(parseSyncPruneOnly("0")).toBe(false);
+    expect(() => parseSyncPruneOnly("maybe")).toThrow(/Invalid SYNC_PRUNE_ONLY/);
+  });
+
+  it("exits cleanly with skippedDueToLock=true when another worker holds the lease lock", async () => {
+    const mockDb = createMockDb([]);
+    const fetchCandidateMock = vi.fn();
+    const pruneMock = vi.fn();
+    const { logger, infos } = createTestLogger();
+
+    const summary = await runSync({
+      db: mockDb.db,
+      useLock: true,
+      acquireSyncLock: vi.fn(async () => ({
+        acquired: false as const,
+        activeHolder: {
+          ranAt: "2026-11-23T10:00:00.000Z",
+          marker: "__SYNC_LOCK__:other:2026-11-23T10:25:00.000Z",
+        },
+      })),
+      fetchCandidateRepos: fetchCandidateMock,
+      pruneDatabase: pruneMock,
+      logger,
+    });
+
+    expect(summary).toEqual({
+      fetchedCount: 0,
+      aiProcessedCount: 0,
+      updatedStarsOnly: 0,
+      failedCount: 0,
+      errorSummary: null,
+      classified: [],
+      skippedDueToLock: true,
+    });
+    expect(fetchCandidateMock).not.toHaveBeenCalled();
+    expect(pruneMock).not.toHaveBeenCalled();
+    expect(mockDb.insertSyncLogCalls).toHaveLength(0);
+    expect(infos.join("\n")).toContain("exiting cleanly with status 0");
+  });
+
+  it("releases the distributed lock in finally even when candidate fetch throws", async () => {
+    const mockDb = createMockDb([]);
+    const releaseMock = vi.fn(async () => undefined);
+    const { logger } = createTestLogger();
+
+    await expect(
+      runSync({
+        db: mockDb.db,
+        useLock: true,
+        acquireSyncLock: vi.fn(async () => ({
+          acquired: true as const,
+          handle: {
+            marker: "__SYNC_LOCK__:test",
+            acquiredAt: new Date(),
+            expiresAt: new Date(),
+            release: releaseMock,
+          },
+        })),
+        fetchCandidateRepos: async () => {
+          throw new Error("GitHub network failure");
+        },
+        logger,
+      }),
+    ).rejects.toThrow("GitHub network failure");
+
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+    expect(mockDb.insertSyncLogCalls).toHaveLength(1);
+  });
+
+  it("skips low-star new candidates when DB is near capacity while still updating existing tools and running post-sync prune", async () => {
+    const lowStarNew = makeRepo({
+      id: 3001,
+      name: "low-star-new",
+      full_name: "acme/low-star-new",
+      stargazers_count: 600,
+    });
+    const highStarNew = makeRepo({
+      id: 3002,
+      name: "high-star-new",
+      full_name: "acme/high-star-new",
+      stargazers_count: 4500,
+    });
+    const existingLowStar = makeRepo({
+      id: 3003,
+      name: "existing-low-star",
+      full_name: "acme/existing-low-star",
+      stargazers_count: 700,
+    });
+
+    const mockDb = createMockDb([
+      { githubId: 3003, readmeSha: "sha-existing-3003" },
+    ]);
+    const fetchReadmeMock = vi.fn(
+      async (fullName: string): Promise<CleanReadmeResult> => ({
+        sha:
+          fullName === "acme/existing-low-star"
+            ? "sha-existing-3003"
+            : `sha-${fullName}`,
+        text: "README",
+      }),
+    );
+    const batchMock = vi.fn(async (inputs: readonly ClassifyRepoInput[]) =>
+      inputs.map((input) => ({
+        fullName: input.fullName,
+        ok: true as const,
+        result: {
+          provider: "Groq-120B",
+          classification: makeClassification(),
+        },
+      })),
+    );
+    const fakePruneSummary: PruneDatabaseSummary = {
+      dbSizeBytes: 390 * 1024 * 1024,
+      dbSizeMb: 390,
+      totalToolsBefore: 4001,
+      totalToolsAfter: 3995,
+      prunedToolsCount: 6,
+      prunedMaxStars: 800,
+      prunedSyncLogsCount: 2,
+      vacuumRan: true,
+      config: {
+        maxTools: 4000,
+        pruneThresholdMb: 380,
+        pruneBatchSize: 100,
+        minToolsKeep: 500,
+        syncLogsMaxRows: 300,
+      },
+    };
+    const releaseMock = vi.fn(async () => undefined);
+    const pruneMock = vi.fn(async () => fakePruneSummary);
+    const { logger, infos } = createTestLogger();
+
+    const summary = await runSync({
+      db: mockDb.db,
+      useLock: true,
+      enablePrune: true,
+      acquireSyncLock: vi.fn(async () => ({
+        acquired: true as const,
+        handle: {
+          marker: "__SYNC_LOCK__:test",
+          acquiredAt: new Date(),
+          expiresAt: new Date(),
+          release: releaseMock,
+        },
+      })),
+      getStarFloorThreshold: vi.fn(async () => ({
+        dbSizeBytes: 390 * 1024 * 1024,
+        dbSizeMb: 390,
+        totalTools: 4000,
+        isNearCapacity: true,
+        minEligibleStars: 800,
+      })),
+      pruneDatabase: pruneMock,
+      fetchCandidateRepos: async () => [
+        lowStarNew,
+        highStarNew,
+        existingLowStar,
+      ],
+      fetchCleanReadme: fetchReadmeMock,
+      classifyRepoBatch: batchMock,
+      sleep: vi.fn(async () => undefined),
+      env: { SYNC_LIMIT: "10", SYNC_BATCH_SIZE: "5", SYNC_DELAY_MS: "0" },
+      logger,
+    });
+
+    // low-star-new (600 <= 800) never fetched README or called AI
+    expect(fetchReadmeMock).not.toHaveBeenCalledWith("acme/low-star-new");
+    expect(batchMock).toHaveBeenCalledTimes(1);
+    expect(batchMock.mock.calls[0]?.[0].map((i) => i.fullName)).toEqual([
+      "acme/high-star-new",
+    ]);
+
+    expect(summary).toMatchObject({
+      fetchedCount: 3,
+      aiProcessedCount: 1,
+      updatedStarsOnly: 1,
+      failedCount: 0,
+      skippedDueToLock: false,
+      skippedLowStarCount: 1,
+      minEligibleStars: 800,
+      pruneSummary: fakePruneSummary,
+    });
+    expect(pruneMock).toHaveBeenCalledTimes(1);
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+    expect(infos.join("\n")).toContain("Đã bỏ qua 1 repo mới có <= 800 sao");
+  });
+
+  it("supports SYNC_PRUNE_ONLY=true without crawling GitHub or calling AI", async () => {
+    const mockDb = createMockDb([]);
+    const fetchCandidateMock = vi.fn();
+    const fakePruneSummary: PruneDatabaseSummary = {
+      dbSizeBytes: 250 * 1024 * 1024,
+      dbSizeMb: 250,
+      totalToolsBefore: 4050,
+      totalToolsAfter: 4000,
+      prunedToolsCount: 50,
+      prunedMaxStars: 620,
+      prunedSyncLogsCount: 10,
+      vacuumRan: true,
+      config: {
+        maxTools: 4000,
+        pruneThresholdMb: 380,
+        pruneBatchSize: 100,
+        minToolsKeep: 500,
+        syncLogsMaxRows: 300,
+      },
+    };
+    const pruneMock = vi.fn(async () => fakePruneSummary);
+    const { logger } = createTestLogger();
+
+    const summary = await runSync({
+      db: mockDb.db,
+      useLock: false,
+      enablePrune: true,
+      pruneDatabase: pruneMock,
+      fetchCandidateRepos: fetchCandidateMock,
+      env: { SYNC_PRUNE_ONLY: "true" },
+      logger,
+    });
+
+    expect(fetchCandidateMock).not.toHaveBeenCalled();
+    expect(pruneMock).toHaveBeenCalledTimes(1);
+    expect(summary).toMatchObject({
+      fetchedCount: 0,
+      aiProcessedCount: 0,
+      updatedStarsOnly: 0,
+      failedCount: 0,
+      pruneSummary: fakePruneSummary,
+    });
   });
 });
