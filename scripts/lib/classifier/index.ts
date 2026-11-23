@@ -1,8 +1,11 @@
 import { sanitizeErrorMessage } from "@/lib/sanitize-error";
 import { type AiClassification } from "@/lib/validator";
-import { DEFAULT_MAX_COOLDOWN_WAIT_MS } from "./cooldown";
 import {
-  areAllProvidersCoolingDownBeyondLimit,
+  AllProvidersExhaustedError,
+  areAllProvidersUnavailable,
+  DEFAULT_MAX_COOLDOWN_WAIT_MS,
+} from "./cooldown";
+import {
   executeWithProviderFallback,
   type ClassifyRepoOptions,
 } from "./fallback";
@@ -35,7 +38,12 @@ export interface ClassifyRepoResult {
 
 export type BatchClassifyOutcome =
   | { fullName: string; ok: true; result: ClassifyRepoResult }
-  | { fullName: string; ok: false; error: string };
+  | {
+      fullName: string;
+      ok: false;
+      error: string;
+      allProvidersLongTermCooldown?: boolean;
+    };
 
 /**
  * Phân loại repository qua chuỗi fallback 10 AI provider chuẩn OpenAI-compatible
@@ -93,11 +101,15 @@ export async function classifyRepoBatch(
       const result = await classifyRepo(single, options);
       return [{ fullName: single.fullName, ok: true, result }];
     } catch (error) {
+      const isLongTerm =
+        error instanceof AllProvidersExhaustedError &&
+        error.allLongTermCooldown;
       return [
         {
           fullName: single.fullName,
           ok: false,
           error: sanitizeErrorMessage(error),
+          ...(isLongTerm ? { allProvidersLongTermCooldown: true } : {}),
         },
       ];
     }
@@ -122,6 +134,7 @@ export async function classifyRepoBatch(
   const batchLabel = `batch(${inputs.length} repos)`;
 
   const resolvedMap = new Map<string, ClassifyRepoResult>();
+  let batchLongTermExhausted = false;
 
   try {
     const { data: batchMap, provider } = await executeWithProviderFallback(
@@ -145,6 +158,12 @@ export async function classifyRepoBatch(
       resolvedMap.set(fullName, { classification, provider });
     }
   } catch (batchError) {
+    if (
+      batchError instanceof AllProvidersExhaustedError &&
+      batchError.allLongTermCooldown
+    ) {
+      batchLongTermExhausted = true;
+    }
     console.warn(
       `[classifier] Batch fallback to per-repo classification (${inputs.length} repos): ${sanitizeErrorMessage(batchError)}`,
     );
@@ -165,12 +184,14 @@ export async function classifyRepoBatch(
         fullName: input.fullName,
         ok: false,
         error: allProvidersExhaustedReason,
+        allProvidersLongTermCooldown: true,
       });
       continue;
     }
 
     if (
-      areAllProvidersCoolingDownBeyondLimit(
+      batchLongTermExhausted ||
+      areAllProvidersUnavailable(
         activeProviders,
         options.providerCooldowns,
         nowFn(),
@@ -185,6 +206,7 @@ export async function classifyRepoBatch(
         fullName: input.fullName,
         ok: false,
         error: allProvidersExhaustedReason,
+        allProvidersLongTermCooldown: true,
       });
       continue;
     }
@@ -197,10 +219,18 @@ export async function classifyRepoBatch(
         result: fallbackResult,
       });
     } catch (error) {
+      const sanitized = sanitizeErrorMessage(error);
+      const isLongTerm =
+        error instanceof AllProvidersExhaustedError &&
+        error.allLongTermCooldown;
+      if (isLongTerm) {
+        allProvidersExhaustedReason = sanitized;
+      }
       outcomes.push({
         fullName: input.fullName,
         ok: false,
-        error: sanitizeErrorMessage(error),
+        error: sanitized,
+        ...(isLongTerm ? { allProvidersLongTermCooldown: true } : {}),
       });
     }
   }

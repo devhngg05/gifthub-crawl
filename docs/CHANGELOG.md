@@ -2,6 +2,29 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.28] - 2026-11-23 (Tách module Rate Limiter & Gia cố giới hạn bộ nhớ cho `/api/admin/session`)
+### Đã tái cấu trúc & Gia cố
+- **Tách module Rate Limiter (`src/lib/admin-rate-limit.ts`):**
+  - Chuyển toàn bộ bộ đếm giới hạn tốc độ đăng nhập quản trị (`RATE_LIMIT_WINDOW_MS`, `MAX_FAILED_ATTEMPTS`, `MAX_RATE_LIMIT_ENTRIES`, `checkRateLimit`, `recordFailedAttempt`, `clearFailedAttempts`, `resetSessionRateLimitForTests`, `getRateLimitEntryCountForTests`) ra khỏi route handler.
+  - Gia cố `pruneExpiredRateLimits()` với cơ chế xóa FIFO các khóa cũ nhất khi `Map.size >= MAX_RATE_LIMIT_ENTRIES` sau khi đã dọn các mục hết hạn, bảo đảm kích thước `Map` không bao giờ vượt trần `500` bản ghi.
+- **Làm sạch export Route Handler (`src/app/api/admin/session/route.ts`):**
+  - Chỉ giữ lại các HTTP method export hợp lệ của Next.js App Router (`GET`, `POST`, `DELETE`) để `npm run build` không gặp lỗi invalid Route export.
+- **Kiểm thử (`src/app/api/admin/session/__tests__/route.test.ts`, `src/lib/__tests__/admin-rate-limit.test.ts`):**
+  - Cập nhật import `resetSessionRateLimitForTests` sang `@/lib/admin-rate-limit` và bổ sung unit test cho cơ chế hết hạn, xóa chọn lọc, và chặn trần FIFO của `Map`.
+
+## [0.1.27] - 2026-11-23 (Xử lý triệt để Daily Quota Cooldown, Batching thật & Circuit Breaker cho Sync Worker)
+### Đã sửa lỗi & Tối ưu
+- **Nhận diện Hard/Soft Daily Quota & Cooldown dài hạn (`scripts/lib/classifier/cooldown.ts`, `transport.ts`, `fallback.ts`, `index.ts`):**
+  - Tách 2 mức nhận diện lỗi HTTP 429: **Hard Daily Quota** (`tokens per day`, `requests per day`, `\bTPD\b`, `\bRPD\b`, `PerDay`, `daily limit/quota`, `per day`) khóa ngay lập tức tối thiểu `DAILY_QUOTA_COOLDOWN_MS` (30 phút) ở ngay lần lỗi đầu tiên (`nextCount >= 1`), và **Soft/Ambiguous Quota** (`exceeded your current quota` / `quota exceeded`) giữ nguyên leo thang ở lần lỗi thứ 2 (`nextCount >= 2`).
+  - Nâng cấp `parseRateLimitRetryAfterMs()` hỗ trợ parse thêm đơn vị giờ trong chuỗi `try again in` (`1h23m45.5s`, `2h5m`, `45m10s`) và bỏ trần 90s (`MAX_RATE_LIMIT_COOLDOWN_MS`) đối với Hard Daily Quota.
+  - Bổ sung `areAllProvidersUnavailable()`, `getEarliestProviderRecoveryMs()`, `formatRecoveryDuration()` và lớp lỗi `AllProvidersExhaustedError` (mang cờ `allLongTermCooldown` và `earliestRecoveryMs`) với thông điệp tổng hợp rút gọn (`<= 600` ký tự khi toàn bộ provider cạn dài hạn).
+  - Trong `classifyRepoBatch()`: nhận diện ngay `AllProvidersExhaustedError` có `allLongTermCooldown === true`, gắn cờ `allProvidersLongTermCooldown: true` lên outcome lỗi và fail-fast phần fallback gọi lẻ còn lại.
+- **Batching thật & Circuit Breaker trong `scripts/sync-tools.ts` và `scripts/lib/sync/reclassify.ts`:**
+  - Chuyển chế độ sync thường mặc định sang gom lô tối đa `SYNC_BATCH_SIZE` (sau khi lọc `readmeSha` không đổi và tôn trọng `SYNC_LIMIT`) và gọi `classifyRepoBatch()` thật để dùng 1 System Prompt cho cả lô (vẫn giữ fallback gọi `classifyRepo` khi caller truyền riêng mock `options.classifyRepo`), đồng thời truyền đầy đủ `env` xuống tầng classifier.
+  - Bổ sung **Circuit Breaker** vào cả `runSync` và `runReclassifySync`: khi gặp `AllProvidersExhaustedError` (`allLongTermCooldown === true`) hoặc `areAllProvidersUnavailable(...) === true`, dừng ngay việc tải README/metadata và gọi AI cho các repo/lô tiếp theo, ghi 1 dòng cảnh báo kèm thời gian hồi phục sớm nhất, vẫn cập nhật `stars`/`lastPushedAt` cho các repo đã tồn tại ở `runSync` và ghi `sync_logs` sạch sẽ.
+- **Kiểm thử (`scripts/lib/__tests__/classifier.test.ts`, `scripts/__tests__/sync-tools.test.ts`):**
+  - Mở rộng test cho Groq `TPD`, Gemini `PerDay` vs soft quota, parse chuỗi `try again in` có giờ, `AllProvidersExhaustedError`, `areAllProvidersUnavailable`, batching thật trong `runSync`, và Circuit Breaker trong cả `runSync` lẫn `runReclassifySync`.
+
 ## [0.1.26] - 2026-11-23 (Tối ưu đếm Sidebar bằng `GROUP BY` & vá unhandled promise rejection trong `tools-page-query`)
 ### Đã tối ưu & Sửa lỗi
 - **Gộp nhóm đếm Sidebar ngay trên PostgreSQL (`src/lib/queries/tools-page-query.ts`, `src/lib/ui-helpers.ts`):**

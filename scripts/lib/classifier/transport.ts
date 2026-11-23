@@ -1,6 +1,6 @@
 import { AiClassificationSchema, type AiClassification } from "@/lib/validator";
 import {
-  isDailyQuotaErrorBody,
+  classifyDailyQuotaErrorBody,
   parseRateLimitRetryAfterMs,
   ProviderRateLimitError,
   ProviderServerError,
@@ -120,10 +120,16 @@ export async function requestProviderJsonPayload(
     const snippet = sanitizeResponseSnippet(rawBody, provider.apiKey);
     const errorMessage = `HTTP ${response.status} [${endpoint}]${snippet ? ` (${snippet})` : ""}`;
     if (response.status === 429) {
+      const quotaSeverity = classifyDailyQuotaErrorBody(rawBody);
+      const isHardDaily = quotaSeverity === "hard";
+      const isDaily = quotaSeverity !== "none";
       throw new ProviderRateLimitError(
         errorMessage,
-        parseRateLimitRetryAfterMs(response.headers, rawBody, nowMs),
-        isDailyQuotaErrorBody(rawBody),
+        parseRateLimitRetryAfterMs(response.headers, rawBody, nowMs, {
+          isHardDailyQuota: isHardDaily,
+        }),
+        isDaily,
+        isHardDaily,
       );
     }
     if (response.status >= 500 && response.status <= 599) {

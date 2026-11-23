@@ -1,7 +1,11 @@
 import { redactSecrets, sanitizeErrorMessage } from "@/lib/sanitize-error";
 import {
+  AllProvidersExhaustedError,
+  areAllProvidersUnavailable,
   COOLDOWN_WAIT_BUFFER_MS,
   DEFAULT_MAX_COOLDOWN_WAIT_MS,
+  formatRecoveryDuration,
+  getEarliestProviderRecoveryMs,
   MAX_COOLDOWN_WAIT_ROUNDS,
   ProviderRateLimitError,
   recordProviderFailureCooldown,
@@ -26,14 +30,42 @@ export function areAllProvidersCoolingDownBeyondLimit(
   nowMs: number,
   maxCooldownWaitMs: number,
 ): boolean {
-  if (!cooldownMap || activeProviders.length === 0) {
-    return false;
+  return areAllProvidersUnavailable(
+    activeProviders,
+    cooldownMap,
+    nowMs,
+    maxCooldownWaitMs,
+  );
+}
+
+function buildExhaustedErrorMessage(
+  label: string,
+  failures: readonly string[],
+  allLongTermCooldown: boolean,
+  earliestRecoveryMs: number | null,
+): string {
+  if (allLongTermCooldown) {
+    const compactFailures = failures.map((entry) =>
+      entry.length > 90 ? `${entry.slice(0, 87)}...` : entry,
+    );
+    const recoveryHint =
+      earliestRecoveryMs !== null
+        ? ` [all cooling down; earliest recovery ~${formatRecoveryDuration(earliestRecoveryMs)}]`
+        : " [all cooling down]";
+    const prefix = `All AI providers failed for ${label}${recoveryHint}: `;
+    const maxDetailLen = Math.max(0, 600 - prefix.length);
+    const rawDetails = compactFailures.join("; ");
+    const details =
+      rawDetails.length > maxDetailLen && maxDetailLen > 3
+        ? `${rawDetails.slice(0, maxDetailLen - 3)}...`
+        : rawDetails.slice(0, maxDetailLen);
+    return `${prefix}${details}`;
   }
 
-  return activeProviders.every((provider) => {
-    const until = cooldownMap.get(provider.name);
-    return until !== undefined && until - nowMs > maxCooldownWaitMs;
-  });
+  const fullMessage = `All AI providers failed for ${label}: ${failures.join("; ")}`;
+  return fullMessage.length > 1800
+    ? `${fullMessage.slice(0, 1797)}...`
+    : fullMessage;
 }
 
 function sanitizeProviderFailureReason(
@@ -202,7 +234,26 @@ export async function executeWithProviderFallback<T>(
     }
   }
 
-  throw new Error(
-    `All AI providers failed for ${label}: ${failures.join("; ")}`,
+  const finalNowMs = nowFn();
+  const allLongTermCooldown = areAllProvidersUnavailable(
+    activeProviders,
+    cooldownMap,
+    finalNowMs,
+    maxCooldownWaitMs,
+  );
+  const earliestRecoveryMs = getEarliestProviderRecoveryMs(
+    activeProviders,
+    cooldownMap,
+    finalNowMs,
+  );
+  throw new AllProvidersExhaustedError(
+    buildExhaustedErrorMessage(
+      label,
+      failures,
+      allLongTermCooldown,
+      earliestRecoveryMs,
+    ),
+    allLongTermCooldown,
+    earliestRecoveryMs,
   );
 }

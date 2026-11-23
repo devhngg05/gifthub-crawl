@@ -5,7 +5,18 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { z } from "zod";
 import { db, type DatabaseClient } from "@/db";
 import { sanitizeErrorMessage } from "@/lib/sanitize-error";
-import { classifyRepo, classifyRepoBatch } from "./lib/classifier";
+import {
+  AllProvidersExhaustedError,
+  areAllProvidersUnavailable,
+  classifyRepo,
+  classifyRepoBatch,
+  DEFAULT_MAX_COOLDOWN_WAIT_MS,
+  formatRecoveryDuration,
+  getActiveProviders,
+  getEarliestProviderRecoveryMs,
+  type BatchClassifyOutcome,
+  type ClassifyRepoInput,
+} from "./lib/classifier";
 import {
   fetchCandidateRepos,
   fetchCleanReadme,
@@ -196,6 +207,7 @@ export async function runSync(
       delayMs,
       syncLimit,
       syncBatchSize,
+      env,
       now,
       logger,
     });
@@ -239,13 +251,172 @@ export async function runSync(
   const errors: string[] = [];
   const classified: ClassifiedRepoSummary[] = [];
   const providerCooldowns = new Map<string, number>();
+  const activeProviders = getActiveProviders(env);
+  // Chỉ dùng single mode khi syncBatchSize=1 hoặc caller truyền mock classifyRepo mà không truyền classifyRepoBatch
+  const useBatchClassification =
+    syncBatchSize > 1 &&
+    (options.classifyRepoBatch !== undefined ||
+      options.classifyRepo === undefined);
+
+  let circuitBroken = false;
+  const tripCircuitBreaker = (recoveryMs?: number | null) => {
+    if (circuitBroken) {
+      return;
+    }
+    circuitBroken = true;
+    const effectiveRecoveryMs =
+      recoveryMs ??
+      getEarliestProviderRecoveryMs(
+        activeProviders,
+        providerCooldowns,
+        now().getTime(),
+      );
+    const recoveryText =
+      effectiveRecoveryMs !== null
+        ? ` (ước tính hồi phục sớm nhất sau ~${formatRecoveryDuration(effectiveRecoveryMs)})`
+        : "";
+    logger.warn(
+      `[sync-tools] Circuit breaker kích hoạt: toàn bộ AI provider đã cạn hạn mức/cooldown dài${recoveryText}. Dừng tải README và gọi AI cho các repo tiếp theo.`,
+    );
+  };
+
+  interface PendingBatchItem {
+    repo: GitHubRepoItem;
+    readmeSha: string | null;
+    existingUserNotes: string | null;
+    classifyInput: ClassifyRepoInput;
+  }
+
+  const pendingBatch: PendingBatchItem[] = [];
+  let batchNumber = 0;
+
+  const flushPendingBatch = async () => {
+    if (pendingBatch.length === 0) {
+      return;
+    }
+
+    const batchItems = pendingBatch.splice(0, pendingBatch.length);
+    batchNumber += 1;
+    logger.info(
+      `[sync-tools] Đang phân loại AI lô ${batchNumber} (${batchItems.length} repo)...`,
+    );
+
+    let outcomes: BatchClassifyOutcome[];
+    try {
+      outcomes = await classifyRepoBatchImpl(
+        batchItems.map((item) => item.classifyInput),
+        {
+          env,
+          providerCooldowns,
+          sleep: sleepImpl,
+          now: () => now().getTime(),
+        },
+      );
+    } catch (error) {
+      const reason = sanitizeErrorMessage(error);
+      for (const item of batchItems) {
+        failedCount += 1;
+        errors.push(`${item.repo.full_name}: ${reason}`);
+        logger.warn(`[sync-tools] Skipped ${item.repo.full_name}: ${reason}`);
+      }
+      const isLongTerm =
+        (error instanceof AllProvidersExhaustedError &&
+          error.allLongTermCooldown) ||
+        areAllProvidersUnavailable(
+          activeProviders,
+          providerCooldowns,
+          now().getTime(),
+          DEFAULT_MAX_COOLDOWN_WAIT_MS,
+        );
+      if (isLongTerm) {
+        tripCircuitBreaker(
+          error instanceof AllProvidersExhaustedError
+            ? error.earliestRecoveryMs
+            : null,
+        );
+      }
+      return;
+    }
+
+    let batchHitLongTermCooldown = false;
+
+    for (let i = 0; i < batchItems.length; i += 1) {
+      const item = batchItems[i];
+      const outcome = outcomes[i];
+
+      if (!outcome || !outcome.ok) {
+        failedCount += 1;
+        const reason = outcome
+          ? outcome.error
+          : "Missing classification outcome";
+        errors.push(`${item.repo.full_name}: ${reason}`);
+        logger.warn(`[sync-tools] Skipped ${item.repo.full_name}: ${reason}`);
+        if (outcome && !outcome.ok && outcome.allProvidersLongTermCooldown) {
+          batchHitLongTermCooldown = true;
+        }
+        continue;
+      }
+
+      try {
+        await upsertClassifiedTool(
+          dbClient,
+          item.repo,
+          item.readmeSha,
+          outcome.result.classification,
+          now(),
+          item.existingUserNotes,
+        );
+
+        aiProcessedCount += 1;
+        classified.push({
+          fullName: item.repo.full_name,
+          provider: outcome.result.provider,
+          subCategory: outcome.result.classification.sub_category,
+          usability: outcome.result.classification.usability,
+        });
+
+        logger.info(
+          `[sync-tools] [${aiProcessedCount}/${syncLimit}] ${item.repo.full_name} -> ${outcome.result.classification.sub_category} (${outcome.result.provider})`,
+        );
+      } catch (dbError) {
+        failedCount += 1;
+        const reason = sanitizeErrorMessage(dbError);
+        errors.push(`${item.repo.full_name}: ${reason}`);
+        logger.warn(
+          `[sync-tools] Skipped DB upsert ${item.repo.full_name}: ${reason}`,
+        );
+      }
+    }
+
+    if (
+      batchHitLongTermCooldown ||
+      areAllProvidersUnavailable(
+        activeProviders,
+        providerCooldowns,
+        now().getTime(),
+        DEFAULT_MAX_COOLDOWN_WAIT_MS,
+      )
+    ) {
+      tripCircuitBreaker();
+    }
+  };
 
   for (const repo of candidates) {
     try {
       const existing = existingMap.get(repo.id);
 
-      // Repo mới nhưng đã chạm SYNC_LIMIT: dừng vòng lặp sớm cho sạch log và tiết kiệm quota.
+      // Khi Circuit Breaker đã kích hoạt: tuyệt đối không tải README hay gọi AI, chỉ cập nhật stars cho repo đã tồn tại.
+      if (circuitBroken) {
+        if (existing !== undefined) {
+          await updateStarsAndMetadataOnly(dbClient, repo, now());
+          updatedStarsOnly += 1;
+        }
+        continue;
+      }
+
+      // Repo mới nhưng đã chạm SYNC_LIMIT: xả lô đang chờ (nếu có) và dừng vòng lặp sớm.
       if (!existing && aiAttemptedCount >= syncLimit) {
+        await flushPendingBatch();
         logger.info(
           `[sync-tools] Reached SYNC_LIMIT (${syncLimit}) at new repo ${repo.full_name}; stopping loop early.`,
         );
@@ -270,29 +441,52 @@ export async function runSync(
       }
 
       aiAttemptedCount += 1;
+      const classifyInput: ClassifyRepoInput = {
+        name: repo.name,
+        fullName: repo.full_name,
+        description: repo.description ?? "",
+        homepage: repo.homepage ?? null,
+        language: repo.language,
+        topics: repo.topics,
+        readmeText: readme.text,
+      };
+
+      if (useBatchClassification) {
+        pendingBatch.push({
+          repo,
+          readmeSha: readme.sha,
+          existingUserNotes: existing?.userNotes ?? null,
+          classifyInput,
+        });
+
+        if (
+          pendingBatch.length >= syncBatchSize ||
+          aiAttemptedCount >= syncLimit
+        ) {
+          await flushPendingBatch();
+          if (!circuitBroken && aiAttemptedCount < syncLimit && delayMs > 0) {
+            await sleepImpl(delayMs);
+          }
+        }
+        continue;
+      }
+
       if ((aiAttemptedCount - 1) % syncBatchSize === 0) {
-        const batchNumber =
+        const singleBatchNumber =
           Math.floor((aiAttemptedCount - 1) / syncBatchSize) + 1;
         const batchSize = Math.min(
           syncBatchSize,
-          syncLimit - (batchNumber - 1) * syncBatchSize,
+          syncLimit - (singleBatchNumber - 1) * syncBatchSize,
         );
         logger.info(
-          `[sync-tools] Đang tải README & phân loại lô ${batchNumber} (${batchSize} repo)...`,
+          `[sync-tools] Đang tải README & phân loại lô ${singleBatchNumber} (${batchSize} repo)...`,
         );
       }
 
       const { classification, provider } = await classifyRepoImpl(
+        classifyInput,
         {
-          name: repo.name,
-          fullName: repo.full_name,
-          description: repo.description ?? "",
-          homepage: repo.homepage ?? null,
-          language: repo.language,
-          topics: repo.topics,
-          readmeText: readme.text,
-        },
-        {
+          env,
           providerCooldowns,
           sleep: sleepImpl,
           now: () => now().getTime(),
@@ -326,8 +520,27 @@ export async function runSync(
       const reason = sanitizeErrorMessage(error);
       errors.push(`${repo.full_name}: ${reason}`);
       logger.warn(`[sync-tools] Skipped ${repo.full_name}: ${reason}`);
+
+      const isLongTerm =
+        (error instanceof AllProvidersExhaustedError &&
+          error.allLongTermCooldown) ||
+        areAllProvidersUnavailable(
+          activeProviders,
+          providerCooldowns,
+          now().getTime(),
+          DEFAULT_MAX_COOLDOWN_WAIT_MS,
+        );
+      if (isLongTerm) {
+        tripCircuitBreaker(
+          error instanceof AllProvidersExhaustedError
+            ? error.earliestRecoveryMs
+            : null,
+        );
+      }
     }
   }
+
+  await flushPendingBatch();
 
   const errorSummary =
     errors.length > 0

@@ -1,11 +1,7 @@
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  DELETE,
-  GET,
-  POST,
-  resetSessionRateLimitForTests,
-} from "@/app/api/admin/session/route";
+import { DELETE, GET, POST } from "@/app/api/admin/session/route";
+import { resetSessionRateLimitForTests } from "@/lib/admin-rate-limit";
 import {
   ADMIN_SESSION_COOKIE_NAME,
   createAdminSessionToken,

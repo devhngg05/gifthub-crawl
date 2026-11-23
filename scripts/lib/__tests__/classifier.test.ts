@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TAXONOMY_COMPACT_GUIDE } from "@/config/taxonomy";
 import {
+  AllProvidersExhaustedError,
   areAllProvidersCoolingDownBeyondLimit,
+  areAllProvidersUnavailable,
   buildBatchSystemPrompt,
   buildBatchUserPrompt,
   buildChatCompletionsEndpoint,
   buildSystemPrompt,
   buildUserPrompt,
+  classifyDailyQuotaErrorBody,
   classifyRepo,
   classifyRepoBatch,
   COOLDOWN_WAIT_BUFFER_MS,
@@ -16,13 +19,17 @@ import {
   DEFAULT_RATE_LIMIT_COOLDOWN_MS,
   DEFAULT_TIMEOUT_MS,
   extractJsonFromModelOutput,
+  formatRecoveryDuration,
   GEMINI_BATCH_MAX_TOKENS,
   GEMINI_SINGLE_MAX_TOKENS,
   getActiveProviders,
+  getEarliestProviderRecoveryMs,
   GROQ_QWEN_BATCH_MAX_TOKENS,
   GROQ_QWEN_MAX_TOKENS,
   isDailyQuotaErrorBody,
+  isHardDailyQuotaErrorBody,
   isResponseFormatUnsupportedError,
+  isSoftDailyQuotaErrorBody,
   isTimeoutOrAbortError,
   MAX_BATCH_README_PROMPT_CHARS,
   MAX_COOLDOWN_WAIT_ROUNDS,
@@ -622,7 +629,7 @@ describe("classifier — OpenAI-compatible payload & multi-provider fallback", (
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("parses Retry-After headers and Groq TPM wait hints accurately", () => {
+  it("parses Retry-After headers, hour-formatted Groq hints, and skips 90s cap only for hard daily quotas", () => {
     expect(
       parseRateLimitRetryAfterMs(new Headers({ "retry-after": "15" }), ""),
     ).toBe(15_000);
@@ -661,6 +668,51 @@ describe("classifier — OpenAI-compatible payload & multi-provider fallback", (
     expect(
       parseRateLimitRetryAfterMs(new Headers({ "retry-after": "600" }), ""),
     ).toBe(MAX_RATE_LIMIT_COOLDOWN_MS);
+
+    // Hour-based short-term hint without hard daily marker still clamps to 90s
+    expect(
+      parseRateLimitRetryAfterMs(
+        new Headers(),
+        "Rate limit reached on TPM. Please try again in 1h15m30s.",
+      ),
+    ).toBe(MAX_RATE_LIMIT_COOLDOWN_MS);
+
+    // Hard Daily Quota (TPD / tokens per day) preserves full hour/minute wait without clamping to 90s
+    expect(
+      parseRateLimitRetryAfterMs(
+        new Headers(),
+        '{"error":{"message":"Rate limit reached for model on tokens per day (TPD): Limit 200000, Used 200000. Please try again in 1h15m30s."}}',
+      ),
+    ).toBe(4_530_000);
+
+    expect(
+      parseRateLimitRetryAfterMs(
+        new Headers(),
+        "Daily limit reached (RPD). Please try again in 2h5m.",
+      ),
+    ).toBe(7_500_000);
+
+    expect(
+      parseRateLimitRetryAfterMs(
+        new Headers(),
+        "Requests per day limit exceeded. Please try again in 45m10s.",
+      ),
+    ).toBe(2_710_000);
+
+    expect(
+      parseRateLimitRetryAfterMs(
+        new Headers(),
+        "Rate limit reached on tokens per day (TPD). Try again in 1h23m45.5s.",
+      ),
+    ).toBe(5_025_500);
+
+    // Hard daily quota without explicit retry hint defaults to 30m (DAILY_QUOTA_COOLDOWN_MS)
+    expect(
+      parseRateLimitRetryAfterMs(
+        new Headers(),
+        "Quota exceeded for metric: GenerateRequestsPerDay",
+      ),
+    ).toBe(DAILY_QUOTA_COOLDOWN_MS);
 
     expect(parseRateLimitRetryAfterMs(new Headers(), "rate limited")).toBe(
       DEFAULT_RATE_LIMIT_COOLDOWN_MS,
@@ -768,9 +820,40 @@ describe("classifier — OpenAI-compatible payload & multi-provider fallback", (
     ]);
   });
 
-  it("escalates HTTP 429 daily-quota cooldown to 30m after 2 consecutive failures and resets count on success", async () => {
+  it("escalates soft ambiguous 429 quota cooldown to 30m after 2 consecutive failures and resets count on success", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
 
+    expect(
+      isHardDailyQuotaErrorBody(
+        "Quota exceeded for metric: GenerateRequestsPerDay",
+      ),
+    ).toBe(true);
+    expect(
+      isHardDailyQuotaErrorBody(
+        "Rate limit reached for model on tokens per day (TPD): Limit 200000",
+      ),
+    ).toBe(true);
+    expect(
+      isSoftDailyQuotaErrorBody(
+        "You exceeded your current quota, please check billing",
+      ),
+    ).toBe(true);
+    expect(
+      isSoftDailyQuotaErrorBody("Quota exceeded for metric: GenerateRequestsPerDay"),
+    ).toBe(false);
+    expect(
+      classifyDailyQuotaErrorBody(
+        "Rate limit reached on tokens per day (TPD)",
+      ),
+    ).toBe("hard");
+    expect(
+      classifyDailyQuotaErrorBody(
+        "You exceeded your current quota, please check billing",
+      ),
+    ).toBe("soft");
+    expect(
+      classifyDailyQuotaErrorBody("TPM limit reached, try again in 5s"),
+    ).toBe("none");
     expect(
       isDailyQuotaErrorBody("Quota exceeded for metric: GenerateRequestsPerDay"),
     ).toBe(true);
@@ -789,7 +872,7 @@ describe("classifier — OpenAI-compatible payload & multi-provider fallback", (
         liteAttempt += 1;
         if (liteAttempt === 1 || liteAttempt === 2 || liteAttempt === 4) {
           return new Response(
-            '{"error":{"message":"You exceeded your current quota (PerDay limit)"}}',
+            '{"error":{"message":"You exceeded your current quota, please check your plan and billing details"}}',
             { status: 429 },
           );
         }
@@ -800,7 +883,7 @@ describe("classifier — OpenAI-compatible payload & multi-provider fallback", (
 
     const geminiEnv = { GEMINI_API_KEY: FULL_MOCK_ENV.GEMINI_API_KEY };
 
-    // 1st daily-quota 429 -> 60_000 ms cooldown, falls back to Gemini-3.1-Flash-Lite
+    // 1st soft/ambiguous quota 429 -> 60_000 ms cooldown, falls back to Gemini-3.1-Flash-Lite
     const res1 = await classifyRepo(SAMPLE_INPUT, {
       env: geminiEnv,
       fetchImpl: fetchMock,
@@ -812,7 +895,7 @@ describe("classifier — OpenAI-compatible payload & multi-provider fallback", (
       fakeNowMs + DEFAULT_RATE_LIMIT_COOLDOWN_MS,
     );
 
-    // Advance past 60s -> 2nd consecutive daily-quota 429 -> escalates to 1_800_000 ms (30 minutes)
+    // Advance past 60s -> 2nd consecutive soft quota 429 -> escalates to 1_800_000 ms (30 minutes)
     fakeNowMs += DEFAULT_RATE_LIMIT_COOLDOWN_MS + 1_000;
     const res2 = await classifyRepo(SAMPLE_INPUT, {
       env: geminiEnv,
@@ -847,7 +930,7 @@ describe("classifier — OpenAI-compatible payload & multi-provider fallback", (
     expect(res4.provider).toBe("Gemini-3.5-Flash-Lite");
     expect(providerCooldowns.has("Gemini-3.5-Flash-Lite")).toBe(false);
 
-    // Next daily-quota 429 (liteAttempt 4) gets 60_000 ms again (counter was reset!)
+    // Next soft quota 429 (liteAttempt 4) gets 60_000 ms again (counter was reset!)
     const res5 = await classifyRepo(SAMPLE_INPUT, {
       env: geminiEnv,
       fetchImpl: fetchMock,
@@ -857,6 +940,103 @@ describe("classifier — OpenAI-compatible payload & multi-provider fallback", (
     expect(res5.provider).toBe("Gemini-3.1-Flash-Lite");
     expect(providerCooldowns.get("Gemini-3.5-Flash-Lite")).toBe(
       fakeNowMs + DEFAULT_RATE_LIMIT_COOLDOWN_MS,
+    );
+  });
+
+  it("immediately locks hard daily quota (Groq TPD and Gemini PerDay) for >= 30m on the 1st failure and throws AllProvidersExhaustedError", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const fakeNowMs = 20_000_000;
+    const providerCooldowns = new Map<string, number>();
+    const sleepMock = vi.fn(async () => undefined);
+
+    // 1. Groq TPD hits on 1st failure -> locks immediately for full hint (1h15m30s) or >= 30m; PerDay locks immediately for 30m
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      // Groq-120B: TPD with 1h15m30s -> 4_530_000ms immediately
+      .mockResolvedValueOnce(
+        new Response(
+          '{"error":{"message":"Rate limit reached for model on tokens per day (TPD): Limit 200000, Used 200000. Please try again in 1h15m30s."}}',
+          { status: 429 },
+        ),
+      )
+      // Groq-20B-Fast: TPD with short 5m hint -> enforced minimum DAILY_QUOTA_COOLDOWN_MS (1_800_000ms)
+      .mockResolvedValueOnce(
+        new Response(
+          '{"error":{"message":"Rate limit reached on tokens per day (TPD). Please try again in 5m."}}',
+          { status: 429 },
+        ),
+      )
+      // Groq-Qwen-27B: TPD without hint -> DAILY_QUOTA_COOLDOWN_MS (1_800_000ms)
+      .mockResolvedValueOnce(
+        new Response(
+          '{"error":{"message":"Daily quota exhausted for requests per day (RPD)"}}',
+          { status: 429 },
+        ),
+      );
+
+    let caught: unknown;
+    try {
+      await classifyRepo(SAMPLE_INPUT, {
+        env: { GROQ_API_KEY: FULL_MOCK_ENV.GROQ_API_KEY },
+        fetchImpl: fetchMock,
+        providerCooldowns,
+        sleep: sleepMock,
+        now: () => fakeNowMs,
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(sleepMock).not.toHaveBeenCalled();
+    expect(providerCooldowns.get("Groq-120B")).toBe(fakeNowMs + 4_530_000);
+    expect(providerCooldowns.get("Groq-20B-Fast")).toBe(
+      fakeNowMs + DAILY_QUOTA_COOLDOWN_MS,
+    );
+    expect(providerCooldowns.get("Groq-Qwen-27B")).toBe(
+      fakeNowMs + DAILY_QUOTA_COOLDOWN_MS,
+    );
+
+    expect(caught).toBeInstanceOf(AllProvidersExhaustedError);
+    const exhaustedErr = caught as AllProvidersExhaustedError;
+    expect(exhaustedErr.allLongTermCooldown).toBe(true);
+    expect(exhaustedErr.earliestRecoveryMs).toBe(DAILY_QUOTA_COOLDOWN_MS);
+    expect(exhaustedErr.message.length).toBeLessThanOrEqual(600);
+    expect(exhaustedErr.message).toContain("earliest recovery ~30m");
+
+    const groqProviders = getActiveProviders({
+      GROQ_API_KEY: FULL_MOCK_ENV.GROQ_API_KEY,
+    });
+    expect(
+      areAllProvidersUnavailable(groqProviders, providerCooldowns, fakeNowMs),
+    ).toBe(true);
+    expect(
+      getEarliestProviderRecoveryMs(groqProviders, providerCooldowns, fakeNowMs),
+    ).toBe(DAILY_QUOTA_COOLDOWN_MS);
+    expect(formatRecoveryDuration(4_530_000)).toBe("1h16m");
+
+    // 2. Gemini PerDay triggers >= 30m on the 1st failure (not 60s)
+    const geminiCooldowns = new Map<string, number>();
+    const geminiFetch = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          '{"error":{"message":"Quota exceeded for metric: GenerateRequestsPerDay"}}',
+          { status: 429 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        makeChatCompletionResponse(JSON.stringify(VALID_AI_PAYLOAD)),
+      );
+    const geminiResult = await classifyRepo(SAMPLE_INPUT, {
+      env: { GEMINI_API_KEY: FULL_MOCK_ENV.GEMINI_API_KEY },
+      fetchImpl: geminiFetch,
+      providerCooldowns: geminiCooldowns,
+      now: () => fakeNowMs,
+    });
+    expect(geminiResult.provider).toBe("Gemini-3.1-Flash-Lite");
+    expect(geminiCooldowns.get("Gemini-3.5-Flash-Lite")).toBe(
+      fakeNowMs + DAILY_QUOTA_COOLDOWN_MS,
     );
   });
 
@@ -1529,6 +1709,7 @@ describe("classifier — prompt precision & batch classification", () => {
     for (const outcome of outcomes) {
       if (!outcome.ok) {
         expect(outcome.error).toContain("cooling down beyond 65s limit");
+        expect(outcome.allProvidersLongTermCooldown).toBe(true);
       }
     }
     expect(
@@ -1536,5 +1717,20 @@ describe("classifier — prompt precision & batch classification", () => {
         String(args[0]).includes("skipping remaining per-repo fallbacks"),
       ),
     ).toHaveLength(1);
+
+    // Single-item batch also propagates allProvidersLongTermCooldown when all providers are exhausted long-term
+    const singleLongTermOutcomes = await classifyRepoBatch([SAMPLE_INPUT], {
+      env: { GROQ_API_KEY: FULL_MOCK_ENV.GROQ_API_KEY },
+      fetchImpl: fetchMock,
+      providerCooldowns,
+      sleep: sleepMock,
+      now: () => fakeNowMs,
+      maxCooldownWaitMs: 65_000,
+    });
+    expect(singleLongTermOutcomes).toHaveLength(1);
+    expect(singleLongTermOutcomes[0]?.ok).toBe(false);
+    if (singleLongTermOutcomes[0] && !singleLongTermOutcomes[0].ok) {
+      expect(singleLongTermOutcomes[0].allProvidersLongTermCooldown).toBe(true);
+    }
   });
 });

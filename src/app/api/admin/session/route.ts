@@ -1,6 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import {
+  checkRateLimit,
+  clearFailedAttempts,
+  recordFailedAttempt,
+} from "@/lib/admin-rate-limit";
+import {
   ADMIN_SESSION_COOKIE_NAME,
   createAdminSessionToken,
   getAdminSessionCookieOptions,
@@ -10,10 +15,7 @@ import {
   verifySameOriginRequest,
 } from "@/lib/auth";
 
-const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
-const MAX_FAILED_ATTEMPTS = 5;
 const FAILED_LOGIN_DELAY_MS = 250;
-const MAX_RATE_LIMIT_ENTRIES = 500;
 const NO_STORE_HEADERS = { "Cache-Control": "no-store" } as const;
 
 const AdminSessionLoginSchema = z
@@ -22,71 +24,12 @@ const AdminSessionLoginSchema = z
   })
   .strict();
 
-interface RateLimitRecord {
-  failures: number;
-  windowStartMs: number;
-}
-
-const failedAttemptsByIp = new Map<string, RateLimitRecord>();
-
-/** Đặt lại bộ đếm giới hạn tốc độ đăng nhập phục vụ unit test. */
-export function resetSessionRateLimitForTests(): void {
-  failedAttemptsByIp.clear();
-}
-
 function getClientIp(request: NextRequest): string {
   return (
     request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
     request.headers.get("x-real-ip")?.trim() ||
     "unknown"
   );
-}
-
-function pruneExpiredRateLimits(nowMs: number): void {
-  if (failedAttemptsByIp.size <= MAX_RATE_LIMIT_ENTRIES) {
-    return;
-  }
-  for (const [ip, record] of failedAttemptsByIp.entries()) {
-    if (nowMs - record.windowStartMs >= RATE_LIMIT_WINDOW_MS) {
-      failedAttemptsByIp.delete(ip);
-    }
-  }
-}
-
-function checkRateLimit(
-  ip: string,
-  nowMs: number,
-): { blocked: boolean; retryAfterSeconds: number } {
-  const record = failedAttemptsByIp.get(ip);
-  if (!record) {
-    return { blocked: false, retryAfterSeconds: 0 };
-  }
-
-  const elapsed = nowMs - record.windowStartMs;
-  if (elapsed >= RATE_LIMIT_WINDOW_MS) {
-    failedAttemptsByIp.delete(ip);
-    return { blocked: false, retryAfterSeconds: 0 };
-  }
-
-  if (record.failures >= MAX_FAILED_ATTEMPTS) {
-    const retryAfterSeconds = Math.max(
-      1,
-      Math.ceil((RATE_LIMIT_WINDOW_MS - elapsed) / 1000),
-    );
-    return { blocked: true, retryAfterSeconds };
-  }
-
-  return { blocked: false, retryAfterSeconds: 0 };
-}
-
-function recordFailedAttempt(ip: string, nowMs: number): void {
-  pruneExpiredRateLimits(nowMs);
-  const existing = failedAttemptsByIp.get(ip);
-  if (!existing || nowMs - existing.windowStartMs >= RATE_LIMIT_WINDOW_MS) {
-    failedAttemptsByIp.set(ip, { failures: 1, windowStartMs: nowMs });
-    return;
-  }
-  existing.failures += 1;
 }
 
 async function applyFailedLoginDelay(): Promise<void> {
@@ -165,7 +108,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     );
   }
 
-  failedAttemptsByIp.delete(clientIp);
+  clearFailedAttempts(clientIp);
 
   if (isDevAdminBypassEnabled()) {
     return NextResponse.json(

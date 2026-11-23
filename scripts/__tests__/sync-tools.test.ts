@@ -1,11 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DatabaseClient } from "@/db";
 import { syncLogs, tools } from "@/db/schema";
 import type { AiClassification } from "@/lib/validator";
-import { classifyRepo, type ClassifyRepoInput } from "../lib/classifier";
+import {
+  AllProvidersExhaustedError,
+  classifyRepo,
+  classifyRepoBatch,
+  DAILY_QUOTA_COOLDOWN_MS,
+  type ClassifyRepoInput,
+} from "../lib/classifier";
 import type { CleanReadmeResult, GitHubRepoItem } from "../lib/github";
 import {
   AI_RATE_LIMIT_DELAY_MS,
@@ -193,6 +199,10 @@ function createTestLogger(): { logger: SyncLogger; infos: string[]; warns: strin
     errors,
   };
 }
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("scripts/sync-tools — conventions & helpers", () => {
   it('places `import "./load-env";` on the very first line before `@/db`', () => {
@@ -984,5 +994,284 @@ describe("scripts/sync-tools — runSync pipeline", () => {
       logger,
     });
     expect(summaryAll.aiProcessedCount).toBe(1);
+  });
+
+  it("uses real batching in runSync (groups repos by SYNC_BATCH_SIZE and forwards env) when classifyRepoBatch is used", async () => {
+    const candidates = [
+      makeRepo({ id: 701, name: "unchanged", full_name: "acme/unchanged" }),
+      makeRepo({ id: 702, name: "repo-1", full_name: "acme/repo-1" }),
+      makeRepo({ id: 703, name: "repo-2", full_name: "acme/repo-2" }),
+      makeRepo({ id: 704, name: "repo-3", full_name: "acme/repo-3" }),
+      makeRepo({ id: 705, name: "repo-4", full_name: "acme/repo-4" }),
+      makeRepo({ id: 706, name: "repo-5", full_name: "acme/repo-5" }),
+      makeRepo({ id: 707, name: "over-limit", full_name: "acme/over-limit" }),
+    ];
+
+    const mockDb = createMockDb([{ githubId: 701, readmeSha: "sha-unchanged" }]);
+    const fetchReadmeMock = vi.fn(
+      async (fullName: string): Promise<CleanReadmeResult> => ({
+        sha: fullName === "acme/unchanged" ? "sha-unchanged" : `sha-${fullName}`,
+        text: `README for ${fullName}`,
+      }),
+    );
+
+    const batchMock = vi.fn<typeof classifyRepoBatch>(async (inputs) =>
+      inputs.map((input) => ({
+        fullName: input.fullName,
+        ok: true as const,
+        result: {
+          provider: "Groq-120B",
+          classification: makeClassification(),
+        },
+      })),
+    );
+    const sleepMock = vi.fn(async () => undefined);
+    const { logger } = createTestLogger();
+
+    const env = {
+      SYNC_LIMIT: "5",
+      SYNC_BATCH_SIZE: "3",
+      SYNC_DELAY_MS: "250",
+      GROQ_API_KEY: "gsk_batch_env_test",
+    };
+
+    const summary = await runSync({
+      db: mockDb.db,
+      fetchCandidateRepos: async () => candidates,
+      fetchCleanReadme: fetchReadmeMock,
+      classifyRepoBatch: batchMock,
+      sleep: sleepMock,
+      env,
+      logger,
+    });
+
+    // 5 AI-attempted repos grouped into 2 real batches: [3, 2]
+    expect(batchMock).toHaveBeenCalledTimes(2);
+    expect(batchMock.mock.calls[0]?.[0].map((i) => i.fullName)).toEqual([
+      "acme/repo-1",
+      "acme/repo-2",
+      "acme/repo-3",
+    ]);
+    expect(batchMock.mock.calls[1]?.[0].map((i) => i.fullName)).toEqual([
+      "acme/repo-4",
+      "acme/repo-5",
+    ]);
+    expect(batchMock.mock.calls[0]?.[1]?.env).toBe(env);
+
+    // Sleeps only between batches (not after hitting SYNC_LIMIT on final batch)
+    expect(sleepMock).toHaveBeenCalledTimes(1);
+    expect(sleepMock).toHaveBeenCalledWith(250);
+
+    // Stops before fetching README for acme/over-limit
+    expect(fetchReadmeMock).not.toHaveBeenCalledWith("acme/over-limit");
+    expect(summary).toMatchObject({
+      fetchedCount: 7,
+      aiProcessedCount: 5,
+      updatedStarsOnly: 1,
+      failedCount: 0,
+      errorSummary: null,
+    });
+
+    // Also verify default runSync (neither classifyRepo nor classifyRepoBatch injected) calls real batch endpoint once for 3 repos
+    const mockDbDefault = createMockDb([]);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  results: [
+                    { full_name: "acme/repo-1", ...makeClassification() },
+                    { full_name: "acme/repo-2", ...makeClassification() },
+                    { full_name: "acme/repo-3", ...makeClassification() },
+                  ],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const defaultSummary = await runSync({
+      db: mockDbDefault.db,
+      fetchCandidateRepos: async () => candidates.slice(1, 4),
+      fetchCleanReadme: fetchReadmeMock,
+      sleep: sleepMock,
+      env: {
+        GROQ_API_KEY: "gsk_default_batch_test",
+        SYNC_BATCH_SIZE: "5",
+        SYNC_DELAY_MS: "0",
+      },
+      logger,
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(defaultSummary.aiProcessedCount).toBe(3);
+  });
+
+  it("triggers circuit breaker immediately in runSync when all providers hit daily quota, halting README fetches and AI calls while still updating existing stars", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const candidates = [
+      ...Array.from({ length: 19 }, (_, idx) =>
+        makeRepo({
+          id: 9500 + idx,
+          name: `new-repo-${idx + 1}`,
+          full_name: `acme/new-repo-${idx + 1}`,
+        }),
+      ),
+      makeRepo({
+        id: 9600,
+        name: "existing-after-break",
+        full_name: "acme/existing-after-break",
+        stargazers_count: 8888,
+      }),
+    ];
+
+    const mockDb = createMockDb([
+      { githubId: 9600, readmeSha: "sha-existing-old" },
+    ]);
+    const fetchReadmeMock = vi.fn(
+      async (fullName: string): Promise<CleanReadmeResult> => ({
+        sha: `sha-${fullName}`,
+        text: `README for ${fullName}`,
+      }),
+    );
+
+    const aiFetchMock = vi.fn<typeof fetch>(async () => {
+      return new Response(
+        '{"error":{"message":"Rate limit reached for model on tokens per day (TPD): Limit 200000, Used 200000. Please try again in 45m."}}',
+        { status: 429 },
+      );
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(aiFetchMock);
+
+    const sleepMock = vi.fn(async () => undefined);
+    const { logger, warns } = createTestLogger();
+
+    const summary = await runSync({
+      db: mockDb.db,
+      fetchCandidateRepos: async () => candidates,
+      fetchCleanReadme: fetchReadmeMock,
+      sleep: sleepMock,
+      env: {
+        GROQ_API_KEY: "gsk_tpd_exhausted",
+        SYNC_BATCH_SIZE: "5",
+        SYNC_LIMIT: "20",
+        SYNC_DELAY_MS: "1000",
+      },
+      logger,
+    });
+
+    // Only batch 1 (first 5 repos) fetched README and called the 3 Groq tiers (3 HTTP calls total)
+    expect(fetchReadmeMock).toHaveBeenCalledTimes(5);
+    expect(aiFetchMock).toHaveBeenCalledTimes(3);
+    expect(sleepMock).not.toHaveBeenCalled();
+
+    // Remaining 14 new repos skipped without README/AI; existing-after-break still updated stars without README fetch!
+    expect(mockDb.updateCalls).toHaveLength(1);
+    expect(mockDb.updateCalls[0]?.setPayload).toMatchObject({ stars: 8888 });
+    expect(summary).toMatchObject({
+      fetchedCount: 20,
+      aiProcessedCount: 0,
+      updatedStarsOnly: 1,
+      failedCount: 5,
+    });
+    expect(
+      warns.filter((w) => w.includes("Circuit breaker kích hoạt")),
+    ).toHaveLength(1);
+    expect(warns.some((w) => w.includes("~45m"))).toBe(true);
+    expect(mockDb.insertSyncLogCalls).toHaveLength(1);
+
+    // Also verify single-repo mode (SYNC_BATCH_SIZE=1 / classifyRepo mock) trips circuit breaker immediately on AllProvidersExhaustedError
+    const singleMockDb = createMockDb([]);
+    const singleFetchReadme = vi.fn(async () => ({
+      sha: "sha-1",
+      text: "README",
+    }));
+    const singleClassify = vi
+      .fn()
+      .mockRejectedValue(
+        new AllProvidersExhaustedError(
+          "All AI providers failed [all cooling down; earliest recovery ~30m]",
+          true,
+          DAILY_QUOTA_COOLDOWN_MS,
+        ),
+      );
+    const singleSummary = await runSync({
+      db: singleMockDb.db,
+      fetchCandidateRepos: async () => candidates.slice(0, 10),
+      fetchCleanReadme: singleFetchReadme,
+      classifyRepo: singleClassify,
+      sleep: sleepMock,
+      env: { SYNC_BATCH_SIZE: "1", SYNC_LIMIT: "10" },
+      logger,
+    });
+    expect(singleFetchReadme).toHaveBeenCalledTimes(1);
+    expect(singleClassify).toHaveBeenCalledTimes(1);
+    expect(singleSummary.failedCount).toBe(1);
+  });
+
+  it("triggers circuit breaker in runReclassifySync when first batch exhausts all providers long-term", async () => {
+    const dbRows: ReclassifyMockRow[] = Array.from({ length: 12 }, (_, idx) => ({
+      id: 200 + idx,
+      githubId: 7200 + idx,
+      name: `tool-${idx + 1}`,
+      fullName: `acme/tool-${idx + 1}`,
+      language: "TypeScript",
+      summaryVi: "Tóm tắt cũ",
+    }));
+
+    const mockDb = createMockDb([], dbRows);
+    const fetchMetaMock = vi.fn(async (fullName: string) =>
+      makeRepo({ name: fullName, full_name: fullName }),
+    );
+    const fetchReadmeMock = vi.fn(async (fullName: string) => ({
+      sha: `sha-${fullName}`,
+      text: "README",
+    }));
+    const batchMock = vi.fn(async (inputs: readonly ClassifyRepoInput[]) =>
+      inputs.map((input) => ({
+        fullName: input.fullName,
+        ok: false as const,
+        error: "All AI providers cooling down beyond 65s limit",
+        allProvidersLongTermCooldown: true,
+      })),
+    );
+    const sleepMock = vi.fn(async () => undefined);
+    const { logger, warns } = createTestLogger();
+
+    const summary = await runSync({
+      db: mockDb.db,
+      fetchRepoMetadata: fetchMetaMock,
+      fetchCleanReadme: fetchReadmeMock,
+      classifyRepoBatch: batchMock,
+      sleep: sleepMock,
+      env: {
+        SYNC_RECLASSIFY: "uncategorized",
+        SYNC_LIMIT: "12",
+        SYNC_BATCH_SIZE: "4",
+        SYNC_DELAY_MS: "500",
+      },
+      logger,
+    });
+
+    // Only batch 1 (4 repos) fetched metadata + README and ran AI; batches 2 and 3 never touched
+    expect(fetchMetaMock).toHaveBeenCalledTimes(4);
+    expect(fetchReadmeMock).toHaveBeenCalledTimes(4);
+    expect(batchMock).toHaveBeenCalledTimes(1);
+    expect(sleepMock).not.toHaveBeenCalled();
+    expect(summary).toMatchObject({
+      fetchedCount: 12,
+      aiProcessedCount: 0,
+      failedCount: 4,
+    });
+    expect(
+      warns.some((w) => w.includes("Circuit breaker kích hoạt (reclassify)")),
+    ).toBe(true);
+    expect(mockDb.insertSyncLogCalls).toHaveLength(1);
   });
 });

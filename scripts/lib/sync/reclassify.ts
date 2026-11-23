@@ -4,7 +4,17 @@ import { tools } from "@/db/schema";
 import { sanitizeErrorMessage } from "@/lib/sanitize-error";
 import { buildToolSearchText } from "@/lib/search-engine";
 import type { AiClassification } from "@/lib/validator";
-import type { classifyRepoBatch, ClassifyRepoInput } from "../classifier";
+import {
+  AllProvidersExhaustedError,
+  areAllProvidersUnavailable,
+  DEFAULT_MAX_COOLDOWN_WAIT_MS,
+  formatRecoveryDuration,
+  getActiveProviders,
+  getEarliestProviderRecoveryMs,
+  type BatchClassifyOutcome,
+  type classifyRepoBatch,
+  type ClassifyRepoInput,
+} from "../classifier";
 import type { fetchCleanReadme, fetchRepoMetadata } from "../github";
 import {
   formatClassificationTable,
@@ -137,6 +147,7 @@ export async function runReclassifySync(params: {
   delayMs: number;
   syncLimit: number;
   syncBatchSize: number;
+  env?: Record<string, string | undefined>;
   now: () => Date;
   logger: SyncLogger;
 }): Promise<SyncRunSummary> {
@@ -150,6 +161,7 @@ export async function runReclassifySync(params: {
     delayMs,
     syncLimit,
     syncBatchSize,
+    env = process.env,
     now,
     logger,
   } = params;
@@ -186,6 +198,7 @@ export async function runReclassifySync(params: {
   const errors: string[] = [];
   const classified: ClassifiedRepoSummary[] = [];
   const providerCooldowns = new Map<string, number>();
+  const activeProviders = getActiveProviders(env);
 
   const totalBatches = Math.ceil(rows.length / syncBatchSize);
   for (let bIdx = 0; bIdx < totalBatches; bIdx += 1) {
@@ -254,67 +267,126 @@ export async function runReclassifySync(params: {
     }
 
     if (readyEntries.length > 0) {
-      const outcomes = await classifyRepoBatchImpl(
-        readyEntries.map((entry) => entry.classifyInput),
-        {
-          providerCooldowns,
-          sleep: sleepImpl,
-          now: () => now().getTime(),
-        },
-      );
+      let outcomes: BatchClassifyOutcome[] | null = null;
+      let batchHitLongTermCooldown = false;
+      let explicitRecoveryMs: number | null = null;
 
-      for (let i = 0; i < readyEntries.length; i += 1) {
-        const entry = readyEntries[i];
-        const outcome = outcomes[i];
-
-        if (!outcome || !outcome.ok) {
+      try {
+        outcomes = await classifyRepoBatchImpl(
+          readyEntries.map((entry) => entry.classifyInput),
+          {
+            env,
+            providerCooldowns,
+            sleep: sleepImpl,
+            now: () => now().getTime(),
+          },
+        );
+      } catch (batchError) {
+        const reason = sanitizeErrorMessage(batchError);
+        for (const entry of readyEntries) {
           failedCount += 1;
-          const reason = outcome
-            ? outcome.error
-            : "Missing classification outcome";
           errors.push(`${entry.row.fullName}: ${reason}`);
           logger.warn(
             `[sync-tools] Skipped reclassify ${entry.row.fullName}: ${reason}`,
           );
-          continue;
         }
-
-        try {
-          const updateSet = buildReclassifyUpdateSet(
-            entry.readmeSha,
-            outcome.result.classification,
-            now(),
-            {
-              name: entry.classifyInput.name,
-              fullName: entry.classifyInput.fullName,
-              language: entry.classifyInput.language,
-              userNotes: entry.row.userNotes ?? null,
-              topics: entry.classifyInput.topics,
-            },
-          );
-          await dbClient
-            .update(tools)
-            .set(updateSet)
-            .where(eq(tools.id, entry.row.id));
-
-          aiProcessedCount += 1;
-          classified.push({
-            fullName: entry.row.fullName,
-            provider: outcome.result.provider,
-            subCategory: outcome.result.classification.sub_category,
-            usability: outcome.result.classification.usability,
-          });
-          logger.info(
-            `[sync-tools] [reclassify ${aiProcessedCount}/${rows.length}] ${entry.row.fullName} -> ${outcome.result.classification.sub_category} (${outcome.result.provider})`,
-          );
-        } catch (dbError) {
-          failedCount += 1;
-          const reason = sanitizeErrorMessage(dbError);
-          errors.push(`${entry.row.fullName}: ${reason}`);
-          logger.warn(
-            `[sync-tools] Skipped DB update ${entry.row.fullName}: ${reason}`,
-          );
+        if (
+          batchError instanceof AllProvidersExhaustedError &&
+          batchError.allLongTermCooldown
+        ) {
+          batchHitLongTermCooldown = true;
+          explicitRecoveryMs = batchError.earliestRecoveryMs;
         }
+      }
+
+      if (outcomes) {
+        for (let i = 0; i < readyEntries.length; i += 1) {
+          const entry = readyEntries[i];
+          const outcome = outcomes[i];
+
+          if (!outcome || !outcome.ok) {
+            failedCount += 1;
+            const reason = outcome
+              ? outcome.error
+              : "Missing classification outcome";
+            errors.push(`${entry.row.fullName}: ${reason}`);
+            logger.warn(
+              `[sync-tools] Skipped reclassify ${entry.row.fullName}: ${reason}`,
+            );
+            if (
+              outcome &&
+              !outcome.ok &&
+              outcome.allProvidersLongTermCooldown
+            ) {
+              batchHitLongTermCooldown = true;
+            }
+            continue;
+          }
+
+          try {
+            const updateSet = buildReclassifyUpdateSet(
+              entry.readmeSha,
+              outcome.result.classification,
+              now(),
+              {
+                name: entry.classifyInput.name,
+                fullName: entry.classifyInput.fullName,
+                language: entry.classifyInput.language,
+                userNotes: entry.row.userNotes ?? null,
+                topics: entry.classifyInput.topics,
+              },
+            );
+            await dbClient
+              .update(tools)
+              .set(updateSet)
+              .where(eq(tools.id, entry.row.id));
+
+            aiProcessedCount += 1;
+            classified.push({
+              fullName: entry.row.fullName,
+              provider: outcome.result.provider,
+              subCategory: outcome.result.classification.sub_category,
+              usability: outcome.result.classification.usability,
+            });
+            logger.info(
+              `[sync-tools] [reclassify ${aiProcessedCount}/${rows.length}] ${entry.row.fullName} -> ${outcome.result.classification.sub_category} (${outcome.result.provider})`,
+            );
+          } catch (dbError) {
+            failedCount += 1;
+            const reason = sanitizeErrorMessage(dbError);
+            errors.push(`${entry.row.fullName}: ${reason}`);
+            logger.warn(
+              `[sync-tools] Skipped DB update ${entry.row.fullName}: ${reason}`,
+            );
+          }
+        }
+      }
+
+      const shouldBreakCircuit =
+        batchHitLongTermCooldown ||
+        areAllProvidersUnavailable(
+          activeProviders,
+          providerCooldowns,
+          now().getTime(),
+          DEFAULT_MAX_COOLDOWN_WAIT_MS,
+        );
+
+      if (shouldBreakCircuit) {
+        const recoveryMs =
+          explicitRecoveryMs ??
+          getEarliestProviderRecoveryMs(
+            activeProviders,
+            providerCooldowns,
+            now().getTime(),
+          );
+        const recoveryText =
+          recoveryMs !== null
+            ? ` (ước tính hồi phục sớm nhất sau ~${formatRecoveryDuration(recoveryMs)})`
+            : "";
+        logger.warn(
+          `[sync-tools] Circuit breaker kích hoạt (reclassify): toàn bộ AI provider đã cạn hạn mức/cooldown dài${recoveryText}. Dừng tải metadata/README và gọi AI cho các lô còn lại.`,
+        );
+        break;
       }
 
       if (bIdx < totalBatches - 1 && delayMs > 0) {
