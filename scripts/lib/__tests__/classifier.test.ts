@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TAXONOMY_COMPACT_GUIDE } from "@/config/taxonomy";
 import {
+  areAllProvidersCoolingDownBeyondLimit,
   buildBatchSystemPrompt,
   buildBatchUserPrompt,
   buildChatCompletionsEndpoint,
@@ -18,8 +19,10 @@ import {
   GEMINI_BATCH_MAX_TOKENS,
   GEMINI_SINGLE_MAX_TOKENS,
   getActiveProviders,
+  GROQ_QWEN_BATCH_MAX_TOKENS,
   GROQ_QWEN_MAX_TOKENS,
   isDailyQuotaErrorBody,
+  isResponseFormatUnsupportedError,
   isTimeoutOrAbortError,
   MAX_BATCH_README_PROMPT_CHARS,
   MAX_COOLDOWN_WAIT_ROUNDS,
@@ -29,6 +32,7 @@ import {
   MIN_RATE_LIMIT_COOLDOWN_MS,
   parseRateLimitRetryAfterMs,
   PROVIDERS,
+  resolveProviderMaxTokens,
   sanitizeResponseSnippet,
   SERVER_ERROR_COOLDOWN_MS,
   SERVER_ERROR_ESCALATED_COOLDOWN_MS,
@@ -1196,5 +1200,341 @@ describe("classifier — prompt precision & batch classification", () => {
       String(geminiBatchFetch.mock.calls[0]?.[1]?.body),
     ) as { max_tokens: number };
     expect(geminiBatchBody.max_tokens).toBe(GEMINI_BATCH_MAX_TOKENS);
+  });
+
+  it("configures Groq-Qwen-27B with batchMaxTokens=4096 while keeping single maxTokens=750", async () => {
+    const onlyGroq = getActiveProviders({ GROQ_API_KEY: "gsk_qwen_batch_test" });
+    const qwenProvider = onlyGroq.find((p) => p.name === "Groq-Qwen-27B");
+    expect(qwenProvider).toBeDefined();
+    expect(qwenProvider?.maxTokens).toBe(GROQ_QWEN_MAX_TOKENS);
+    expect(qwenProvider?.batchMaxTokens).toBe(GROQ_QWEN_BATCH_MAX_TOKENS);
+    expect(GROQ_QWEN_BATCH_MAX_TOKENS).toBe(4096);
+    expect(resolveProviderMaxTokens(qwenProvider!, false)).toBe(750);
+    expect(resolveProviderMaxTokens(qwenProvider!, true)).toBe(4096);
+
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      // Groq-120B and Groq-20B-Fast fail so Groq-Qwen-27B executes the batch
+      .mockResolvedValueOnce(new Response("Unavailable", { status: 503 }))
+      .mockResolvedValueOnce(new Response("Unavailable", { status: 503 }))
+      .mockResolvedValueOnce(
+        makeChatCompletionResponse(
+          JSON.stringify({
+            results: [
+              { full_name: "usebruno/bruno", ...VALID_AI_PAYLOAD },
+              { full_name: "ollama/ollama", ...VALID_AI_PAYLOAD },
+            ],
+          }),
+        ),
+      );
+
+    const outcomes = await classifyRepoBatch(
+      [
+        SAMPLE_INPUT,
+        {
+          name: "ollama",
+          fullName: "ollama/ollama",
+          description: "Run local LLMs",
+          language: "Go",
+          topics: ["llm"],
+          readmeText: "Run local LLMs.",
+        },
+      ],
+      {
+        env: { GROQ_API_KEY: "gsk_qwen_batch_test" },
+        fetchImpl: fetchMock,
+      },
+    );
+
+    expect(outcomes.every((o) => o.ok)).toBe(true);
+    expect(outcomes[0]?.ok && outcomes[0].result.provider).toBe("Groq-Qwen-27B");
+    const qwenBatchBody = JSON.parse(
+      String(fetchMock.mock.calls[2]?.[1]?.body),
+    ) as { model: string; max_tokens: number };
+    expect(qwenBatchBody.model).toBe("qwen/qwen3.8-27b");
+    expect(qwenBatchBody.max_tokens).toBe(GROQ_QWEN_BATCH_MAX_TOKENS);
+  });
+
+  it("sanitizes secrets in thrown errors and console.warn across both main loop and waitRound retry loop", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let fakeNowMs = 3_000_000;
+    const providerCooldowns = new Map<string, number>([
+      ["Groq-Qwen-27B", fakeNowMs + 90_000],
+    ]);
+    const sleepMock = vi.fn(async (ms: number) => {
+      fakeNowMs += ms;
+    });
+
+    const dbSecret = "postgresql://admin:super_secret_pw@db.neon.tech/neondb";
+    const groqSecret = FULL_MOCK_ENV.GROQ_API_KEY;
+    const geminiSecret = FULL_MOCK_ENV.GEMINI_API_KEY;
+    const bearerSecret = "Bearer secret-jwt-token-xyz";
+
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      // Main loop: Groq-120B gets 429 (5s) -> Groq-20B-Fast throws raw Error with secrets
+      .mockResolvedValueOnce(
+        new Response("Rate limit", {
+          status: 429,
+          headers: { "retry-after": "5" },
+        }),
+      )
+      .mockRejectedValueOnce(
+        new Error(
+          `Fetch failed with ${bearerSecret}, ${groqSecret}, ${geminiSecret}, ${dbSecret}`,
+        ),
+      )
+      // Wait round 1: Groq-120B retry throws raw Error with secrets
+      .mockRejectedValueOnce(
+        new Error(
+          `Retry failed for ${groqSecret} and ${geminiSecret} at ${dbSecret} (${bearerSecret})`,
+        ),
+      );
+
+    let caught: unknown;
+    try {
+      await classifyRepo(SAMPLE_INPUT, {
+        env: { GROQ_API_KEY: groqSecret },
+        fetchImpl: fetchMock,
+        providerCooldowns,
+        sleep: sleepMock,
+        now: () => fakeNowMs,
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    const errorMessage = (caught as Error).message;
+    expect(errorMessage).toContain("Groq-20B-Fast:");
+    expect(errorMessage).toContain("Groq-120B (retry 1):");
+    expect(errorMessage).toContain("[REDACTED_DATABASE_URL]");
+    expect(errorMessage).toContain("[REDACTED_TOKEN]");
+    expect(errorMessage).toContain("Bearer [REDACTED]");
+
+    const allOutputs = [
+      errorMessage,
+      ...warnSpy.mock.calls.map((args) => args.join(" ")),
+    ];
+    for (const text of allOutputs) {
+      expect(text).not.toContain(groqSecret);
+      expect(text).not.toContain(geminiSecret);
+      expect(text).not.toContain("super_secret_pw");
+      expect(text).not.toContain("secret-jwt-token-xyz");
+    }
+  });
+
+  it("records waitRound failure cooldown using actual nowFn() timestamp at failure time", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let fakeNowMs = 4_000_000;
+    const providerCooldowns = new Map<string, number>([
+      ["Groq-20B-Fast", fakeNowMs + 90_000],
+      ["Groq-Qwen-27B", fakeNowMs + 90_000],
+    ]);
+    const sleepCalls: number[] = [];
+    const cooldownSnapshots: Array<number | undefined> = [];
+    const sleepMock = vi.fn(async (ms: number) => {
+      sleepCalls.push(ms);
+      cooldownSnapshots.push(providerCooldowns.get("Groq-120B"));
+      fakeNowMs += ms;
+    });
+
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      // Main loop: Groq-120B gets 429 (5s) -> cooldown until 4_005_000
+      .mockResolvedValueOnce(
+        new Response("TPM limit", {
+          status: 429,
+          headers: { "retry-after": "5" },
+        }),
+      )
+      // Wait round 1 (after 6s sleep, fakeNowMs = 4_006_000): request takes 7.5s before failing 429 (10s)
+      .mockImplementationOnce(async () => {
+        fakeNowMs += 7_500;
+        return new Response("Still rate limited", {
+          status: 429,
+          headers: { "retry-after": "10" },
+        });
+      })
+      // Wait round 2 (after 10s + 1s sleep): succeeds
+      .mockResolvedValueOnce(
+        makeChatCompletionResponse(JSON.stringify(VALID_AI_PAYLOAD)),
+      );
+
+    const result = await classifyRepo(SAMPLE_INPUT, {
+      env: { GROQ_API_KEY: FULL_MOCK_ENV.GROQ_API_KEY },
+      fetchImpl: fetchMock,
+      providerCooldowns,
+      sleep: sleepMock,
+      now: () => fakeNowMs,
+      maxCooldownWaitMs: 65_000,
+    });
+
+    expect(result.provider).toBe("Groq-120B");
+    // Wait round 1 failure happened at 4_006_000 + 7_500 = 4_013_500, so cooldown must be 4_013_500 + 10_000 = 4_023_500 (not 4_006_000 + 10_000)
+    expect(cooldownSnapshots).toEqual([4_005_000, 4_023_500]);
+    expect(sleepCalls).toEqual([
+      5_000 + COOLDOWN_WAIT_BUFFER_MS,
+      10_000 + COOLDOWN_WAIT_BUFFER_MS,
+    ]);
+  });
+
+  it("only retries HTTP 400 without response_format when the error body mentions response_format/json_object", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(
+      isResponseFormatUnsupportedError(
+        '{"error":{"message":"json_object is not supported for this model"}}',
+      ),
+    ).toBe(true);
+    expect(
+      isResponseFormatUnsupportedError(
+        '{"error":{"message":"structured output mode unavailable"}}',
+      ),
+    ).toBe(true);
+    expect(
+      isResponseFormatUnsupportedError(
+        '{"error":{"message":"maximum context length exceeded"}}',
+      ),
+    ).toBe(false);
+    expect(
+      isResponseFormatUnsupportedError(
+        '{"error":{"message":"invalid model specified"}}',
+      ),
+    ).toBe(false);
+
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      // Groq-120B returns HTTP 400 due to context length -> MUST NOT retry on Groq-120B
+      .mockResolvedValueOnce(
+        new Response(
+          '{"error":{"message":"This model\'s maximum context length is 8192 tokens"}}',
+          { status: 400 },
+        ),
+      )
+      // Groq-20B-Fast returns HTTP 400 due to invalid model -> MUST NOT retry on Groq-20B-Fast
+      .mockResolvedValueOnce(
+        new Response('{"error":{"message":"The model does not exist"}}', {
+          status: 400,
+        }),
+      )
+      // Groq-Qwen-27B returns HTTP 400 mentioning json mode -> SHOULD retry once without response_format
+      .mockResolvedValueOnce(
+        new Response('{"error":{"message":"JSON mode is not supported"}}', {
+          status: 400,
+        }),
+      )
+      .mockResolvedValueOnce(
+        makeChatCompletionResponse(JSON.stringify(VALID_AI_PAYLOAD)),
+      );
+
+    const result = await classifyRepo(SAMPLE_INPUT, {
+      env: { GROQ_API_KEY: FULL_MOCK_ENV.GROQ_API_KEY },
+      fetchImpl: fetchMock,
+    });
+
+    expect(result.provider).toBe("Groq-Qwen-27B");
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(
+      fetchMock.mock.calls.map(
+        (c) => (JSON.parse(String(c[1]?.body)) as { model: string }).model,
+      ),
+    ).toEqual([
+      "openai/gpt-oss-120b",
+      "openai/gpt-oss-20b",
+      "qwen/qwen3.8-27b",
+      "qwen/qwen3.8-27b",
+    ]);
+    const qwenRetryBody = JSON.parse(
+      String(fetchMock.mock.calls[3]?.[1]?.body),
+    ) as { response_format?: unknown };
+    expect(qwenRetryBody.response_format).toBeUndefined();
+  });
+
+  it("fails fast in classifyRepoBatch without per-repo retries when all active providers are cooling down beyond maxCooldownWaitMs", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let fakeNowMs = 5_000_000;
+    const groqProviders = getActiveProviders({
+      GROQ_API_KEY: FULL_MOCK_ENV.GROQ_API_KEY,
+    });
+    const providerCooldowns = new Map<string, number>([
+      ["Groq-120B", fakeNowMs + 120_000],
+      ["Groq-20B-Fast", fakeNowMs + 120_000],
+    ]);
+    expect(
+      areAllProvidersCoolingDownBeyondLimit(
+        groqProviders,
+        providerCooldowns,
+        fakeNowMs,
+        65_000,
+      ),
+    ).toBe(false);
+
+    const sleepMock = vi.fn(async (ms: number) => {
+      fakeNowMs += ms;
+    });
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      // Batch attempt hits TimeoutError on Groq-Qwen-27B (the only remaining active provider), putting it into 180s cooldown
+      .mockRejectedValueOnce(
+        new DOMException("The operation was aborted due to timeout", "TimeoutError"),
+      );
+
+    const batchInputs: ClassifyRepoInput[] = [
+      SAMPLE_INPUT,
+      {
+        name: "ollama",
+        fullName: "ollama/ollama",
+        description: "Run local LLMs",
+        language: "Go",
+        topics: ["llm"],
+        readmeText: "Run local LLMs.",
+      },
+      {
+        name: "open-webui",
+        fullName: "open-webui/open-webui",
+        description: "AI Interface",
+        language: "Python",
+        topics: ["webui"],
+        readmeText: "Self-hosted AI WebUI.",
+      },
+    ];
+
+    const outcomes = await classifyRepoBatch(batchInputs, {
+      env: { GROQ_API_KEY: FULL_MOCK_ENV.GROQ_API_KEY },
+      fetchImpl: fetchMock,
+      providerCooldowns,
+      sleep: sleepMock,
+      now: () => fakeNowMs,
+      maxCooldownWaitMs: 65_000,
+    });
+
+    expect(
+      areAllProvidersCoolingDownBeyondLimit(
+        groqProviders,
+        providerCooldowns,
+        fakeNowMs,
+        65_000,
+      ),
+    ).toBe(true);
+    // Only 1 fetch call for the batch attempt; 0 per-repo fallback fetch calls or sleeps
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(sleepMock).not.toHaveBeenCalled();
+    expect(outcomes).toHaveLength(3);
+    expect(outcomes.every((outcome) => outcome.ok === false)).toBe(true);
+    for (const outcome of outcomes) {
+      if (!outcome.ok) {
+        expect(outcome.error).toContain("cooling down beyond 65s limit");
+      }
+    }
+    expect(
+      warnSpy.mock.calls.filter((args) =>
+        String(args[0]).includes("skipping remaining per-repo fallbacks"),
+      ),
+    ).toHaveLength(1);
   });
 });

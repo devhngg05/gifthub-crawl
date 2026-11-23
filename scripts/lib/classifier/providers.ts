@@ -18,6 +18,7 @@ export const DEFAULT_MAX_TOKENS = 4096;
 export const GEMINI_SINGLE_MAX_TOKENS = 2048;
 export const GEMINI_BATCH_MAX_TOKENS = 4096;
 export const GROQ_QWEN_MAX_TOKENS = 750;
+export const GROQ_QWEN_BATCH_MAX_TOKENS = 4096;
 export const MAX_ERROR_BODY_LENGTH = 200;
 
 export const PROVIDERS: readonly AiProviderConfig[] = [
@@ -60,6 +61,7 @@ export const PROVIDERS: readonly AiProviderConfig[] = [
     apiKeyEnv: "GROQ_API_KEY",
     supportsJsonObjectResponseFormat: true,
     maxTokens: GROQ_QWEN_MAX_TOKENS,
+    batchMaxTokens: GROQ_QWEN_BATCH_MAX_TOKENS,
   },
   {
     name: "Gemini-3.5-Flash",

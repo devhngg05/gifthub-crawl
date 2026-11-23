@@ -2,6 +2,19 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.25] - 2026-11-23 (Vá edge case `classifier` & tách module `transport.ts` / `fallback.ts`)
+### Đã sửa lỗi & Tái cấu trúc
+- **Cấu hình token batch cho `Groq-Qwen-27B` (`scripts/lib/classifier/providers.ts`):**
+  - Bổ sung `GROQ_QWEN_BATCH_MAX_TOKENS = 4096` và gắn `batchMaxTokens` cho `Groq-Qwen-27B` (giữ nguyên `maxTokens: GROQ_QWEN_MAX_TOKENS` = `750` ở chế độ phân loại đơn lẻ).
+- **Tách nhỏ `scripts/lib/classifier/index.ts` và vá edge case (`transport.ts`, `fallback.ts`, `index.ts`):**
+  - Tách logic gọi HTTP & parse/validate JSON sang `scripts/lib/classifier/transport.ts`; tối ưu fallback HTTP 400 chỉ thử lại bỏ `response_format` khi body lỗi liên quan tới `response_format` / `json_object` / `json mode` / `structured output` (`isResponseFormatUnsupportedError`).
+  - Tách vòng lặp fallback & cooldown sang `scripts/lib/classifier/fallback.ts`; luôn làm sạch lỗi bằng `redactSecrets(sanitizeErrorMessage(error), [provider.apiKey])` trước khi đẩy vào `failures` và `console.warn` ở cả vòng thử chính lẫn vòng retry (`waitRound`).
+  - Cập nhật mốc thời gian cooldown trong `catch` của `waitRound` dùng `nowFn()` thực tế tại thời điểm phát sinh lỗi thay vì `effectiveNowMs`.
+  - Bổ sung cơ chế fail-fast trong `classifyRepoBatch()` qua `areAllProvidersCoolingDownBeyondLimit()` để dừng gọi phân loại lẻ cho các repo thiếu còn lại khi mọi active provider đều đang cooldown vượt quá `maxCooldownWaitMs`.
+  - Giữ nguyên toàn bộ public exports tại `scripts/lib/classifier/index.ts` và `scripts/lib/classifier.ts`.
+- **Kiểm thử (`scripts/lib/__tests__/classifier.test.ts`):**
+  - Bổ sung unit test cho `resolveProviderMaxTokens` của `Groq-Qwen-27B` (single vs batch), làm sạch secret ở vòng chính & `waitRound`, mốc `nowFn()` trong `waitRound`, điều kiện retry HTTP 400 có chọn lọc, và fail-fast của `classifyRepoBatch`.
+
 ## [0.1.24] - 2026-11-23 (Thay thế `x-admin-secret` phía trình duyệt bằng `HttpOnly` Signed Cookie Session & Fail-Closed Auth)
 ### Đã cập nhật & Bảo mật
 - **Nâng cấp lõi xác thực (`src/lib/auth.ts`):**
