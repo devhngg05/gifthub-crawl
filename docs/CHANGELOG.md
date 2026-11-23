@@ -2,6 +2,22 @@
 
 Tài liệu theo dõi phiên bản và tiến độ triển khai từng module của `github-tool-radar`. Mọi module hoàn thành phải cập nhật tệp này trước khi kết thúc phiên làm việc.
 
+## [0.1.24] - 2026-11-23 (Thay thế `x-admin-secret` phía trình duyệt bằng `HttpOnly` Signed Cookie Session & Fail-Closed Auth)
+### Đã cập nhật & Bảo mật
+- **Nâng cấp lõi xác thực (`src/lib/auth.ts`):**
+  - Sửa lỗi bypass mặc định ngoài production: hệ thống fail-closed (`503`) ở mọi môi trường nếu thiếu `ADMIN_SECRET`, chỉ cho phép bypass ở local khi đồng thời `NODE_ENV !== "production"` và `ALLOW_DEV_ADMIN_BYPASS === "true"` (ghi `console.warn` tối đa 1 lần).
+  - Giữ SHA-256 + `crypto.timingSafeEqual` để đối chiếu secret khi đăng nhập; bổ sung token phiên stateless ký bằng HMAC-SHA256 từ khóa dẫn xuất của `ADMIN_SECRET` (kèm `iat`, `exp`, `nonce`, kiểm tra chữ ký bằng `timingSafeEqual`).
+  - Cấu hình cookie `gtr_admin_session` với cờ `HttpOnly`, `SameSite=Lax`, `Path=/`, và `Secure` khi `NODE_ENV === "production"`.
+  - Bổ sung kiểm tra `Sec-Fetch-Site` + `Origin`/`Referer` cùng host (`verifySameOriginRequest`) để phòng chống CSRF cho `POST`/`PATCH`/`DELETE`.
+- **API Phiên Quản trị (`src/app/api/admin/session/route.ts`) & `PATCH /api/tools/[id]` (`src/app/api/tools/[id]/route.ts`):**
+  - Tạo mới `GET` / `POST` / `DELETE /api/admin/session` (kèm `Cache-Control: no-store`, giới hạn tốc độ brute-force theo IP trả `429` + `Retry-After` và độ trễ nhẹ khi sai).
+  - Chuyển `PATCH /api/tools/[id]` sang `verifyAdminRequest()` xác thực bằng `HttpOnly` cookie session + kiểm tra CSRF (chỉ giữ fallback header `x-admin-secret` có kiểm soát cho script nội bộ).
+- **Loại bỏ lưu trữ secret trên trình duyệt (`src/hooks/useToolMutations.ts`, `src/components/AdminSecretModal.tsx`, `src/lib/ui-helpers.ts`):**
+  - Xóa bỏ hoàn toàn `src/lib/admin-secret-storage.ts` (không còn dùng `sessionStorage`/`localStorage` hay gửi `x-admin-secret` từ trình duyệt).
+  - Cập nhật `useToolMutations` gọi `POST /api/admin/session` để lấy cookie phiên trước khi gửi lại `PATCH /api/tools/[id]`, và cập nhật nội dung `AdminSecretModal`.
+- **Kiểm thử & Tài liệu (`auth.test.ts`, `session/__tests__/route.test.ts`, `tools/[id]/__tests__/route.test.ts`, `AdminSecretModal.test.tsx`, `.env.example`, `docs/API-CONTRACTS.md`):**
+  - Bổ sung unit test cho cookie hợp lệ, chữ ký giả, token hết hạn, đăng xuất, CSRF sai `Origin`, brute-force `429`, và điều kiện `ALLOW_DEV_ADMIN_BYPASS`.
+
 ## [0.1.23] - 2026-11-23 (Tối ưu PostgreSQL Schema với `timestamptz`, Index quy mô lớn & Quy trình Drizzle Migration)
 ### Đã cập nhật
 - **Schema PostgreSQL & Indexes (`src/db/schema.ts`):**

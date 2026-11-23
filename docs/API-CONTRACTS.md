@@ -1,10 +1,11 @@
 # Hợp đồng API & Tích hợp (`API-CONTRACTS.md`)
 
 ## 1. API cá nhân hóa: `PATCH /api/tools/[id]` (`src/app/api/tools/[id]/route.ts`)
-- **Xác thực (`src/lib/auth.ts`):**
-  - Nếu `ADMIN_SECRET` được khai báo (hoặc `NODE_ENV === 'production'`), bắt buộc kiểm tra header `x-admin-secret` khớp giá trị bằng `crypto.timingSafeEqual` (so sánh SHA-256 digest đồng độ dài). Nếu `production` mà thiếu `ADMIN_SECRET`, trả `503` (fail-closed).
-  - Nếu `ADMIN_SECRET` trống ở local dev (`NODE_ENV !== 'production'`), bypass kèm `console.warn`.
-  - Phía UI mở Modal nhập Admin Key lưu ở `sessionStorage` và gửi qua header `x-admin-secret` (cấm dùng `NEXT_PUBLIC_*`).
+- **Xác thực & Chống CSRF (`src/lib/auth.ts`):**
+  - Chặn CSRF cho các method thay đổi dữ liệu (`POST`/`PATCH`/`DELETE`/`PUT`) bằng kiểm tra `Sec-Fetch-Site` và đối chiếu host của `Origin`/`Referer` với host đích (`403` nếu khác nguồn).
+  - **Fail-closed mặc định:** Nếu thiếu `ADMIN_SECRET`, từ chối với `503 Service Unavailable` ở mọi môi trường. Chỉ cho phép bypass ở local khi đồng thời `NODE_ENV !== 'production'` **và** `ALLOW_DEV_ADMIN_BYPASS === 'true'` (chỉ ghi `console.warn` đúng 1 lần duy nhất).
+  - Phía trình duyệt xác thực hoàn toàn qua cookie phiên `HttpOnly` (`gtr_admin_session`, `SameSite=Lax`, `Path=/`, `Secure` khi `production`) được ký stateless bằng HMAC-SHA256 từ khóa dẫn xuất của `ADMIN_SECRET` (có trường `exp` hết hạn, kiểm tra chữ ký qua `crypto.timingSafeEqual`).
+  - Trình duyệt **không** lưu secret vào `sessionStorage`/`localStorage` và **không** gửi header `x-admin-secret`; server chỉ giữ fallback `x-admin-secret` có kiểm soát cho script nội bộ.
 - **Validation (`src/lib/validator.ts`):**
   - Path param `id`: `z.coerce.number().int().positive()` (sai → `400`).
   - Body schema (`.strict()`, tối thiểu 1 trường):
@@ -16,7 +17,7 @@
     }).strict().refine((d) => Object.keys(d).length > 0)
     ```
   - Khi cập nhật `subCategory`, server tự động đồng bộ `category` tương ứng từ `TAXONOMY` trong `src/config/taxonomy.ts` và cập nhật `updatedAt`.
-- **Mã phản hồi:** `200 OK` (`{ tool }`), `400 Bad Request`, `401 Unauthorized`, `404 Not Found`, `503 Service Unavailable`, `500 Internal Server Error`.
+- **Mã phản hồi:** `200 OK` (`{ tool }`), `400 Bad Request`, `401 Unauthorized`, `403 Forbidden`, `404 Not Found`, `503 Service Unavailable`, `500 Internal Server Error`.
 
 ## 2. Bộ kiểm duyệt AI (`src/lib/validator.ts` — `AiClassificationSchema`)
 - `summary_vi`: string (10–500 ký tự).
@@ -68,3 +69,13 @@
   - `categories`: tối đa **3** ngách gợi ý suy luận từ từ điển đồng nghĩa song ngữ `parseSearchQuery(q)` (`{ slug, label, categoryLabel }`).
   - `tools`: tối đa **6** công cụ khớp nhất theo Tầng 1 (tự fallback Tầng 2 nếu Tầng 1 = 0, hỗ trợ chịu lỗi nếu DB chưa bật `pg_trgm`) sắp theo `buildSearchRelevanceScore DESC, stars DESC, id DESC` (`{ id, name, fullName, summaryVi, subCategory, stars, usability }`).
 - **Backfill & `pg_trgm` (`scripts/backfill-search-text.ts`):** Chạy thủ công để bật `pg_trgm`, tạo `tools_search_text_trgm_idx` và cập nhật `search_text` cho toàn bộ công cụ đang có trong DB.
+
+## 6. API Phiên Quản trị: `/api/admin/session` (`src/app/api/admin/session/route.ts`)
+- **Header chung:** Luôn trả về `Cache-Control: no-store` và tuyệt đối không lộ `ADMIN_SECRET`.
+- **`GET /api/admin/session`:** Trả về `200 OK` với `{ authenticated: boolean, authRequired: boolean }`.
+- **`POST /api/admin/session`:**
+  - Kiểm tra CSRF cùng nguồn (`Origin`/`Referer`/`Sec-Fetch-Site`, sai → `403`).
+  - Giới hạn brute-force theo IP (`429 Too Many Requests` + header `Retry-After` sau 5 lần sai trong cửa sổ 15 phút; kèm làm chậm nhẹ 250ms khi sai ngoài môi trường `test`).
+  - Validate body `{ secret: string }` (Zod `.strict()`, trim `1..512` ký tự, sai → `400`), kiểm tra `ADMIN_SECRET` qua SHA-256 + `crypto.timingSafeEqual` (`401` nếu sai, `503` nếu thiếu `ADMIN_SECRET` và không bật bypass).
+  - Nếu hợp lệ: cấp cookie `gtr_admin_session` (`HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` khi `NODE_ENV === 'production'`, `Max-Age=43200`) và trả về `200 OK` `{ authenticated: true, authRequired: true }` (hoặc `authRequired: false` khi bypass dev đang bật).
+- **`DELETE /api/admin/session`:** Kiểm tra CSRF (`403` nếu sai nguồn), xóa cookie `gtr_admin_session` (`Max-Age=0`) và trả về `200 OK` `{ authenticated: false }`.

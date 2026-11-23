@@ -7,7 +7,7 @@ import {
 } from "@/config/taxonomy";
 import { db } from "@/db";
 import { tools } from "@/db/schema";
-import { verifyAdminSecret } from "@/lib/auth";
+import { verifyAdminRequest } from "@/lib/auth";
 import { sanitizeErrorMessage } from "@/lib/sanitize-error";
 import { buildToolSearchText } from "@/lib/search-engine";
 import { ToolIdParamSchema, ToolPatchSchema } from "@/lib/validator";
@@ -20,7 +20,7 @@ export async function PATCH(
   request: NextRequest,
   context: { params: Promise<{ id: string }> },
 ): Promise<NextResponse> {
-  const auth = verifyAdminSecret(request.headers.get("x-admin-secret"));
+  const auth = verifyAdminRequest(request);
   if (!auth.authorized) {
     return NextResponse.json(
       { error: auth.error ?? "Unauthorized" },

@@ -2,6 +2,11 @@ import { PgDialect } from "drizzle-orm/pg-core";
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolRow } from "@/db/schema";
+import {
+  ADMIN_SESSION_COOKIE_NAME,
+  createAdminSessionToken,
+  resetAuthStateForTests,
+} from "@/lib/auth";
 
 const {
   mockSelectLimit,
@@ -73,19 +78,33 @@ function makeToolRow(overrides: Partial<ToolRow> = {}): ToolRow {
 function makePatchRequest(
   id: string,
   body: unknown,
-  headers: Record<string, string> = {},
+  options: {
+    headers?: Record<string, string>;
+    cookie?: string;
+  } = {},
 ): [NextRequest, { params: Promise<{ id: string }> }] {
   const isRawString = typeof body === "string";
+  const headers: Record<string, string> = {
+    host: "localhost",
+    "content-type": "application/json",
+    ...options.headers,
+  };
+  if (options.cookie) {
+    headers.cookie = options.cookie;
+  }
+
   const request = new NextRequest(`http://localhost/api/tools/${id}`, {
     method: "PATCH",
-    headers: {
-      "content-type": "application/json",
-      ...headers,
-    },
+    headers,
     body: isRawString ? body : JSON.stringify(body),
   });
 
   return [request, { params: Promise.resolve({ id }) }];
+}
+
+function makeSessionCookieHeader(token?: string): string {
+  const resolved = token ?? createAdminSessionToken()!;
+  return `${ADMIN_SESSION_COOKIE_NAME}=${resolved}`;
 }
 
 function getSetPayload(callIndex = 0): Record<string, unknown> {
@@ -97,6 +116,7 @@ function getSetPayload(callIndex = 0): Record<string, unknown> {
 describe("PATCH /api/tools/[id]", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetAuthStateForTests();
     vi.stubEnv("ADMIN_SECRET", "test-admin-secret");
     vi.stubEnv("NODE_ENV", "test");
   });
@@ -104,47 +124,110 @@ describe("PATCH /api/tools/[id]", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.restoreAllMocks();
+    resetAuthStateForTests();
   });
 
-  it("returns 401 when x-admin-secret header is missing or invalid without touching DB", async () => {
+  it("returns 401 when session cookie and header are missing, forged, or expired without touching DB", async () => {
     const [missingReq, missingCtx] = makePatchRequest("42", { isPinned: true });
     const missingRes = await PATCH(missingReq, missingCtx);
-
     expect(missingRes.status).toBe(401);
     expect(await missingRes.json()).toEqual({ error: "Unauthorized" });
 
-    const [wrongReq, wrongCtx] = makePatchRequest(
+    const [forgedReq, forgedCtx] = makePatchRequest(
       "42",
       { isPinned: true },
-      { "x-admin-secret": "wrong-secret" },
+      {
+        headers: { origin: "http://localhost" },
+        cookie: makeSessionCookieHeader("tampered.signature"),
+      },
     );
-    const wrongRes = await PATCH(wrongReq, wrongCtx);
+    const forgedRes = await PATCH(forgedReq, forgedCtx);
+    expect(forgedRes.status).toBe(401);
 
-    expect(wrongRes.status).toBe(401);
+    const expiredToken = createAdminSessionToken({
+      nowMs: Date.now() - 120_000,
+      ttlSeconds: 10,
+    })!;
+    const [expiredReq, expiredCtx] = makePatchRequest(
+      "42",
+      { isPinned: true },
+      {
+        headers: { origin: "http://localhost" },
+        cookie: makeSessionCookieHeader(expiredToken),
+      },
+    );
+    const expiredRes = await PATCH(expiredReq, expiredCtx);
+    expect(expiredRes.status).toBe(401);
+
     expect(mockUpdate).not.toHaveBeenCalled();
   });
 
-  it("returns 503 in production when ADMIN_SECRET is missing without touching DB", async () => {
-    vi.stubEnv("ADMIN_SECRET", "");
-    vi.stubEnv("NODE_ENV", "production");
+  it("returns 403 on cross-origin PATCH even with a valid session cookie (CSRF protection)", async () => {
+    const [req, ctx] = makePatchRequest(
+      "42",
+      { isPinned: true },
+      {
+        headers: { origin: "https://evil.example" },
+        cookie: makeSessionCookieHeader(),
+      },
+    );
+    const res = await PATCH(req, ctx);
+
+    expect(res.status).toBe(403);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("supports controlled x-admin-secret header fallback for internal scripts", async () => {
+    mockReturning.mockResolvedValueOnce([makeToolRow({ isPinned: true })]);
 
     const [req, ctx] = makePatchRequest(
       "42",
       { isPinned: true },
-      { "x-admin-secret": "anything" },
+      { headers: { "x-admin-secret": "test-admin-secret" } },
     );
     const res = await PATCH(req, ctx);
 
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(200);
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed with 503 in both dev and production when ADMIN_SECRET is missing without ALLOW_DEV_ADMIN_BYPASS=true", async () => {
+    vi.stubEnv("ADMIN_SECRET", "");
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("ALLOW_DEV_ADMIN_BYPASS", "false");
+
+    const [devReq, devCtx] = makePatchRequest("42", { isPinned: true });
+    expect((await PATCH(devReq, devCtx)).status).toBe(503);
+
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("ALLOW_DEV_ADMIN_BYPASS", "true");
+    const [prodReq, prodCtx] = makePatchRequest("42", { isPinned: true });
+    expect((await PATCH(prodReq, prodCtx)).status).toBe(503);
+
     expect(mockUpdate).not.toHaveBeenCalled();
   });
 
+  it("bypasses auth in non-production when ADMIN_SECRET is missing and ALLOW_DEV_ADMIN_BYPASS=true", async () => {
+    vi.stubEnv("ADMIN_SECRET", "");
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("ALLOW_DEV_ADMIN_BYPASS", "true");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockReturning.mockResolvedValueOnce([makeToolRow({ isPinned: true })]);
+
+    const [req, ctx] = makePatchRequest("42", { isPinned: true });
+    const res = await PATCH(req, ctx);
+
+    expect(res.status).toBe(200);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("returns 400 for invalid tool id params", async () => {
+    const cookie = makeSessionCookieHeader();
     for (const badId of ["0", "-5", "abc", "3.14"]) {
       const [req, ctx] = makePatchRequest(
         badId,
         { isPinned: true },
-        { "x-admin-secret": "test-admin-secret" },
+        { headers: { origin: "http://localhost" }, cookie },
       );
       const res = await PATCH(req, ctx);
 
@@ -157,7 +240,8 @@ describe("PATCH /api/tools/[id]", () => {
 
   it("returns 400 when request body is malformed JSON", async () => {
     const [req, ctx] = makePatchRequest("42", "{not-valid-json", {
-      "x-admin-secret": "test-admin-secret",
+      headers: { origin: "http://localhost" },
+      cookie: makeSessionCookieHeader(),
     });
     const res = await PATCH(req, ctx);
 
@@ -167,6 +251,7 @@ describe("PATCH /api/tools/[id]", () => {
   });
 
   it("returns 400 for empty body, forbidden extra fields, unknown subCategory, or oversized userNotes", async () => {
+    const cookie = makeSessionCookieHeader();
     const invalidPayloads: unknown[] = [
       {},
       { isPinned: true, isBookmarked: true },
@@ -178,7 +263,8 @@ describe("PATCH /api/tools/[id]", () => {
 
     for (const payload of invalidPayloads) {
       const [req, ctx] = makePatchRequest("42", payload, {
-        "x-admin-secret": "test-admin-secret",
+        headers: { origin: "http://localhost" },
+        cookie,
       });
       const res = await PATCH(req, ctx);
 
@@ -196,7 +282,10 @@ describe("PATCH /api/tools/[id]", () => {
     const [req, ctx] = makePatchRequest(
       "9999",
       { isPinned: true },
-      { "x-admin-secret": "test-admin-secret" },
+      {
+        headers: { origin: "http://localhost" },
+        cookie: makeSessionCookieHeader(),
+      },
     );
     const res = await PATCH(req, ctx);
 
@@ -206,14 +295,17 @@ describe("PATCH /api/tools/[id]", () => {
     expect(mockWhere).toHaveBeenCalledTimes(1);
   });
 
-  it("returns 200 when updating isPinned only without overwriting category/subCategory", async () => {
+  it("returns 200 when updating isPinned only using signed HttpOnly cookie without overwriting category/subCategory", async () => {
     const updatedRow = makeToolRow({ isPinned: true });
     mockReturning.mockResolvedValueOnce([updatedRow]);
 
     const [req, ctx] = makePatchRequest(
       "42",
       { isPinned: true },
-      { "x-admin-secret": "test-admin-secret" },
+      {
+        headers: { origin: "http://localhost" },
+        cookie: makeSessionCookieHeader(),
+      },
     );
     const res = await PATCH(req, ctx);
 
@@ -233,6 +325,7 @@ describe("PATCH /api/tools/[id]", () => {
   });
 
   it("returns 200 when updating userNotes with a string or null and recalculates searchText", async () => {
+    const cookie = makeSessionCookieHeader();
     mockSelectLimit.mockResolvedValueOnce([makeToolRow()]);
     mockReturning.mockResolvedValueOnce([
       makeToolRow({ userNotes: "Dùng cho backend dự án mới" }),
@@ -241,12 +334,14 @@ describe("PATCH /api/tools/[id]", () => {
     const [req1, ctx1] = makePatchRequest(
       "42",
       { userNotes: "Dùng cho backend dự án mới" },
-      { "x-admin-secret": "test-admin-secret" },
+      { headers: { origin: "http://localhost" }, cookie },
     );
     const res1 = await PATCH(req1, ctx1);
     expect(res1.status).toBe(200);
     expect(getSetPayload(0).userNotes).toBe("Dùng cho backend dự án mới");
-    expect(String(getSetPayload(0).searchText)).toContain("dung cho backend du an moi");
+    expect(String(getSetPayload(0).searchText)).toContain(
+      "dung cho backend du an moi",
+    );
 
     mockSelectLimit.mockResolvedValueOnce([
       makeToolRow({ userNotes: "Ghi chú cũ" }),
@@ -255,7 +350,7 @@ describe("PATCH /api/tools/[id]", () => {
     const [req2, ctx2] = makePatchRequest(
       "42",
       { userNotes: null },
-      { "x-admin-secret": "test-admin-secret" },
+      { headers: { origin: "http://localhost" }, cookie },
     );
     const res2 = await PATCH(req2, ctx2);
     expect(res2.status).toBe(200);
@@ -281,7 +376,10 @@ describe("PATCH /api/tools/[id]", () => {
         userNotes: "Cập nhật phân loại chuẩn",
         subCategory: "database-orm",
       },
-      { "x-admin-secret": "test-admin-secret" },
+      {
+        headers: { origin: "http://localhost" },
+        cookie: makeSessionCookieHeader(),
+      },
     );
     const res = await PATCH(req, ctx);
 
@@ -325,7 +423,10 @@ describe("PATCH /api/tools/[id]", () => {
     const [req, ctx] = makePatchRequest(
       "42",
       { subCategory: "ai-coding-agent" },
-      { "x-admin-secret": "test-admin-secret" },
+      {
+        headers: { origin: "http://localhost" },
+        cookie: makeSessionCookieHeader(),
+      },
     );
     const res = await PATCH(req, ctx);
 
@@ -354,7 +455,10 @@ describe("PATCH /api/tools/[id]", () => {
     const [req, ctx] = makePatchRequest(
       "42",
       { isPinned: true },
-      { "x-admin-secret": "test-admin-secret" },
+      {
+        headers: { origin: "http://localhost" },
+        cookie: makeSessionCookieHeader(),
+      },
     );
     const res = await PATCH(req, ctx);
 

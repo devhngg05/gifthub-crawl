@@ -73,11 +73,19 @@ describe("AdminSecretModal", () => {
     expect(document.body.style.overflow).toBe("hidden");
 
     const input = screen.getByLabelText("Khóa quản trị");
+    expect(screen.getByText(/HttpOnly/i)).toBeInTheDocument();
+    expect(screen.queryByText(/sessionStorage/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/x-admin-secret/i)).not.toBeInTheDocument();
+
+    const setSessionSpy = vi.spyOn(Storage.prototype, "setItem");
     await user.type(input, "  my-super-secret  ");
     await user.click(screen.getByRole("button", { name: "Xác nhận & Lưu" }));
 
     expect(onSubmitSpy).toHaveBeenCalledTimes(1);
     expect(onSubmitSpy).toHaveBeenCalledWith("my-super-secret");
+    expect(setSessionSpy).not.toHaveBeenCalled();
+    expect(window.sessionStorage.length).toBe(0);
+    expect(window.localStorage.length).toBe(0);
 
     await waitFor(() => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();

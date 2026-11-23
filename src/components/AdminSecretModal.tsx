@@ -103,11 +103,10 @@ function AdminSecretDialog({
         </div>
 
         <p className="mb-3 text-xs leading-relaxed text-zinc-400">
-          Máy chủ yêu cầu header{" "}
-          <code className="font-mono text-zinc-300">x-admin-secret</code> để
-          lưu thay đổi. Khóa chỉ được lưu tạm trong{" "}
-          <code className="font-mono text-zinc-300">sessionStorage</code> của
-          tab trình duyệt này.
+          Máy chủ yêu cầu phiên quản trị hợp lệ để lưu thay đổi. Khóa chỉ được
+          gửi tới máy chủ một lần để cấp cookie phiên{" "}
+          <code className="font-mono text-zinc-300">HttpOnly</code> đã ký và
+          không lưu trên trình duyệt.
         </p>
 
         <form onSubmit={handleFormSubmit} className="space-y-3">
@@ -164,7 +163,7 @@ function AdminSecretDialog({
 }
 
 /**
- * Hộp thoại nhập khóa quản trị (`x-admin-secret`) khi API trả HTTP 401.
+ * Hộp thoại nhập khóa quản trị để khởi tạo phiên cookie `HttpOnly` khi API trả HTTP 401.
  * Unmount khi đóng để xóa sạch state input, hỗ trợ phím `Escape` và bấm nền ngoài.
  */
 export function AdminSecretModal({

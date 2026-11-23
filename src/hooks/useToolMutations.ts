@@ -3,11 +3,6 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { isValidSubCategory, type SubCategorySlug } from "@/config/taxonomy";
-import {
-  clearStoredAdminSecret,
-  readStoredAdminSecret,
-  saveStoredAdminSecret,
-} from "@/lib/admin-secret-storage";
 import { mapToolPatchErrorMessage } from "@/lib/ui-helpers";
 import type { ToolPatchInput } from "@/lib/validator";
 
@@ -20,7 +15,7 @@ export interface UseToolMutationsInput {
 
 /**
  * Custom hook xử lý các thao tác cá nhân hóa `PATCH /api/tools/[id]`
- * (Ghim, Ghi chú, Đổi ngách), quản lý modal nhập `ADMIN_SECRET` khi 401 và làm mới dữ liệu trang.
+ * (Ghim, Ghi chú, Đổi ngách), quản lý modal đăng nhập phiên cookie `HttpOnly` khi 401 và làm mới dữ liệu trang.
  */
 export function useToolMutations(tool: UseToolMutationsInput) {
   const router = useRouter();
@@ -40,39 +35,25 @@ export function useToolMutations(tool: UseToolMutationsInput) {
   const [pendingPatch, setPendingPatch] = useState<ToolPatchInput | null>(null);
   const [modalError, setModalError] = useState<string | null>(null);
 
-  async function submitPatch(
+  async function sendToolPatch(
     payload: ToolPatchInput,
-    overrideSecret?: string,
+    fromModal: boolean,
   ): Promise<boolean> {
-    if (isSaving) {
-      return false;
-    }
-
-    setIsSaving(true);
-    setErrorMessage(null);
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-
-    const secret = overrideSecret ?? readStoredAdminSecret();
-    if (secret) {
-      headers["x-admin-secret"] = secret;
-    }
-
     try {
       const response = await fetch(`/api/tools/${tool.id}`, {
         method: "PATCH",
-        headers,
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify(payload),
       });
 
       if (response.status === 401) {
-        clearStoredAdminSecret();
         setPendingPatch(payload);
         setModalError(
-          overrideSecret !== undefined
-            ? "Khóa quản trị không đúng, vui lòng kiểm tra lại."
+          fromModal
+            ? "Phiên quản trị không hợp lệ hoặc đã hết hạn, vui lòng thử lại."
             : null,
         );
         return false;
@@ -80,16 +61,12 @@ export function useToolMutations(tool: UseToolMutationsInput) {
 
       if (!response.ok) {
         const mappedError = mapToolPatchErrorMessage(response.status);
-        if (overrideSecret !== undefined) {
+        if (fromModal) {
           setModalError(mappedError);
         } else {
           setErrorMessage(mappedError);
         }
         return false;
-      }
-
-      if (overrideSecret) {
-        saveStoredAdminSecret(overrideSecret);
       }
 
       setPendingPatch(null);
@@ -98,12 +75,25 @@ export function useToolMutations(tool: UseToolMutationsInput) {
       return true;
     } catch {
       const networkError = "Không thể kết nối tới máy chủ, vui lòng thử lại.";
-      if (overrideSecret !== undefined) {
+      if (fromModal) {
         setModalError(networkError);
       } else {
         setErrorMessage(networkError);
       }
       return false;
+    }
+  }
+
+  async function submitPatch(payload: ToolPatchInput): Promise<boolean> {
+    if (isSaving) {
+      return false;
+    }
+
+    setIsSaving(true);
+    setErrorMessage(null);
+
+    try {
+      return await sendToolPatch(payload, false);
     } finally {
       setIsSaving(false);
     }
@@ -145,12 +135,42 @@ export function useToolMutations(tool: UseToolMutationsInput) {
   }
 
   async function handleAdminSecretSubmit(secret: string) {
-    if (!pendingPatch) {
+    if (!pendingPatch || isSaving) {
       return;
     }
-    const ok = await submitPatch(pendingPatch, secret);
-    if (ok && "userNotes" in pendingPatch) {
-      setIsNoteOpen(false);
+
+    setIsSaving(true);
+    setErrorMessage(null);
+    setModalError(null);
+
+    try {
+      const sessionResponse = await fetch("/api/admin/session", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ secret }),
+      });
+
+      if (sessionResponse.status === 401) {
+        setModalError("Khóa quản trị không đúng, vui lòng kiểm tra lại.");
+        return;
+      }
+
+      if (!sessionResponse.ok) {
+        setModalError(mapToolPatchErrorMessage(sessionResponse.status));
+        return;
+      }
+
+      const ok = await sendToolPatch(pendingPatch, true);
+      if (ok && "userNotes" in pendingPatch) {
+        setIsNoteOpen(false);
+      }
+    } catch {
+      setModalError("Không thể kết nối tới máy chủ, vui lòng thử lại.");
+    } finally {
+      setIsSaving(false);
     }
   }
 

@@ -514,17 +514,21 @@ export function getSafeExternalUrl(rawUrl: string): string {
   }
 }
 
-/** Ánh xạ mã trạng thái HTTP từ `PATCH /api/tools/[id]` sang thông báo tiếng Việt thân thiện. */
+/** Ánh xạ mã trạng thái HTTP từ API quản trị sang thông báo tiếng Việt thân thiện. */
 export function mapToolPatchErrorMessage(status: number): string {
   switch (status) {
     case 400:
       return "Dữ liệu gửi lên không hợp lệ.";
+    case 403:
+      return "Yêu cầu bị từ chối vì không cùng nguồn (CSRF).";
     case 404:
       return "Công cụ không còn tồn tại trong cơ sở dữ liệu.";
+    case 429:
+      return "Thử sai quá nhiều lần, vui lòng đợi một lát rồi thử lại.";
     case 500:
       return "Lỗi máy chủ nội bộ, vui lòng thử lại sau.";
     case 503:
-      return "Máy chủ chưa cấu hình ADMIN_SECRET ở môi trường production.";
+      return "Máy chủ chưa cấu hình ADMIN_SECRET.";
     default:
       return `Lỗi cập nhật (HTTP ${status}).`;
   }
