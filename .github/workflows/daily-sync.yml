@@ -2,7 +2,7 @@ name: Continuous GitHub Tool Radar Sync
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "17 */2 * * *"
   deployment_status:
   workflow_dispatch:
     inputs:
